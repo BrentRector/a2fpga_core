@@ -1,0 +1,97 @@
+name: Build A2N20v2 Firmware
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache OSS CAD Suite
+        id: cache-oss-cad
+        uses: actions/cache@v4
+        with:
+          path: /opt/oss-cad-suite
+          key: oss-cad-suite-linux-x64-20250211
+
+      - name: Install OSS CAD Suite
+        if: steps.cache-oss-cad.outputs.cache-hit != 'true'
+        run: |
+          curl -sL https://github.com/YosysHQ/oss-cad-suite-build/releases/download/2025-02-11/oss-cad-suite-linux-x64-20250211.tgz \
+            | tar xz -C /opt
+
+      - name: Verify toolchain
+        run: |
+          export PATH="/opt/oss-cad-suite/bin:$PATH"
+          echo "=== Tool versions ==="
+          yosys --version
+          nextpnr-himbaechel --version || true
+          gowin_pack --version || echo "gowin_pack available"
+          echo "=== Checking plugins ==="
+          yosys -m ghdl -m slang -p "help ghdl" 2>&1 | head -5
+          echo "=== Checking chipdb ==="
+          ls -la /opt/oss-cad-suite/share/nextpnr/himbaechel/gowin/chipdb-GW2A-18C.bin
+
+      - name: Prepare build sources
+        working-directory: boards/a2n20v2
+        run: |
+          chmod +x oss/prepare_build.sh
+          ./oss/prepare_build.sh /tmp/a2n20v2_build
+
+      - name: Synthesize (Yosys + GHDL + slang)
+        working-directory: boards/a2n20v2
+        run: |
+          export PATH="/opt/oss-cad-suite/bin:$PATH"
+          yosys -m ghdl -m slang -l /tmp/synthesis.log build.ys
+          echo "=== Synthesis summary ==="
+          tail -20 /tmp/synthesis.log
+          ls -la a2n20v2.json
+
+      - name: Place & Route (nextpnr-himbaechel)
+        working-directory: boards/a2n20v2
+        run: |
+          export PATH="/opt/oss-cad-suite/bin:$PATH"
+          nextpnr-himbaechel \
+            --device GW2AR-LV18QN88C8/I7 \
+            --chipdb /opt/oss-cad-suite/share/nextpnr/himbaechel/gowin/chipdb-GW2A-18C.bin \
+            --vopt family=GW2A-18C \
+            --vopt cst=/tmp/a2n20v2_build/board_hdl/a2n20v2.cst \
+            --json a2n20v2.json \
+            --write a2n20v2_pnr.json \
+            2>&1 | tee /tmp/pnr.log
+          echo "=== Timing summary ==="
+          grep "Max frequency" /tmp/pnr.log || true
+          grep "Program finished" /tmp/pnr.log
+
+      - name: Generate bitstream (gowin_pack)
+        working-directory: boards/a2n20v2
+        run: |
+          export PATH="/opt/oss-cad-suite/bin:$PATH"
+          gowin_pack -d GW2A-18C -o a2n20v2.fs a2n20v2_pnr.json
+          echo "=== Bitstream generated ==="
+          ls -la a2n20v2.fs
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: a2n20v2-firmware
+          path: boards/a2n20v2/a2n20v2.fs
+          retention-days: 90
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            /tmp/synthesis.log
+            /tmp/pnr.log
+          retention-days: 14
