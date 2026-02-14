@@ -123,7 +123,10 @@ generate
             assign hsync_pulse_size = 62;
             assign vsync_pulse_start = 9;
             assign vsync_pulse_size = 6;
-            assign invert = 1;
+            // CEA-861 480p (VIC 2/3) requires active-HIGH sync pulses.
+            // The previous value (invert = 1) produced active-LOW pulses,
+            // which caused modern HDMI sinks to reject the mode.
+            assign invert = 0;
             end
         4:
         begin
