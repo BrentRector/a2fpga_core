@@ -19,18 +19,28 @@ jobs:
         id: cache-oss-cad
         uses: actions/cache@v4
         with:
-          path: /opt/oss-cad-suite
-          key: oss-cad-suite-linux-x64-20250211
+          path: ~/oss-cad-suite
+          key: oss-cad-suite-linux-x64-20250211-v2
 
       - name: Install OSS CAD Suite
-        if: steps.cache-oss-cad.outputs.cache-hit != 'true'
         run: |
-          curl -fSL https://github.com/YosysHQ/oss-cad-suite-build/releases/download/2025-02-11/oss-cad-suite-linux-x64-20250211.tgz \
-            | sudo tar xz -C /opt
+          if [ -x "$HOME/oss-cad-suite/bin/yosys" ]; then
+            echo "OSS CAD Suite found in cache"
+          else
+            echo "Downloading OSS CAD Suite..."
+            curl -fSL -o /tmp/oss-cad-suite.tgz \
+              https://github.com/YosysHQ/oss-cad-suite-build/releases/download/2025-02-11/oss-cad-suite-linux-x64-20250211.tgz
+            echo "Download complete ($(du -h /tmp/oss-cad-suite.tgz | cut -f1))"
+            echo "Extracting..."
+            tar xzf /tmp/oss-cad-suite.tgz -C "$HOME"
+            rm /tmp/oss-cad-suite.tgz
+          fi
+          echo "Verifying installation..."
+          ls "$HOME/oss-cad-suite/bin/yosys"
 
       - name: Verify toolchain
         run: |
-          export PATH="/opt/oss-cad-suite/bin:$PATH"
+          source ~/oss-cad-suite/environment
           echo "=== Tool versions ==="
           yosys --version
           nextpnr-himbaechel --version || true
@@ -38,7 +48,7 @@ jobs:
           echo "=== Checking plugins ==="
           yosys -m ghdl -m slang -p "help ghdl" 2>&1 | head -5
           echo "=== Checking chipdb ==="
-          ls -la /opt/oss-cad-suite/share/nextpnr/himbaechel/gowin/chipdb-GW2A-18C.bin
+          ls -la ~/oss-cad-suite/share/nextpnr/himbaechel/gowin/chipdb-GW2A-18C.bin
 
       - name: Prepare build sources
         working-directory: boards/a2n20v2
@@ -49,7 +59,7 @@ jobs:
       - name: Synthesize (Yosys + GHDL + slang)
         working-directory: boards/a2n20v2
         run: |
-          export PATH="/opt/oss-cad-suite/bin:$PATH"
+          source ~/oss-cad-suite/environment
           yosys -m ghdl -m slang -l /tmp/synthesis.log build.ys
           echo "=== Synthesis summary ==="
           tail -20 /tmp/synthesis.log
@@ -58,10 +68,10 @@ jobs:
       - name: Place & Route (nextpnr-himbaechel)
         working-directory: boards/a2n20v2
         run: |
-          export PATH="/opt/oss-cad-suite/bin:$PATH"
+          source ~/oss-cad-suite/environment
           nextpnr-himbaechel \
             --device GW2AR-LV18QN88C8/I7 \
-            --chipdb /opt/oss-cad-suite/share/nextpnr/himbaechel/gowin/chipdb-GW2A-18C.bin \
+            --chipdb ~/oss-cad-suite/share/nextpnr/himbaechel/gowin/chipdb-GW2A-18C.bin \
             --vopt family=GW2A-18C \
             --vopt cst=/tmp/a2n20v2_build/board_hdl/a2n20v2.cst \
             --json a2n20v2.json \
@@ -74,7 +84,7 @@ jobs:
       - name: Generate bitstream (gowin_pack)
         working-directory: boards/a2n20v2
         run: |
-          export PATH="/opt/oss-cad-suite/bin:$PATH"
+          source ~/oss-cad-suite/environment
           gowin_pack -d GW2A-18C -o a2n20v2.fs a2n20v2_pnr.json
           echo "=== Bitstream generated ==="
           ls -la a2n20v2.fs
