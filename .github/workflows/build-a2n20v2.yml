@@ -25,8 +25,8 @@ jobs:
       - name: Install OSS CAD Suite
         if: steps.cache-oss-cad.outputs.cache-hit != 'true'
         run: |
-          curl -sL https://github.com/YosysHQ/oss-cad-suite-build/releases/download/2025-02-11/oss-cad-suite-linux-x64-20250211.tgz \
-            | tar xz -C /opt
+          curl -fSL https://github.com/YosysHQ/oss-cad-suite-build/releases/download/2025-02-11/oss-cad-suite-linux-x64-20250211.tgz \
+            | sudo tar xz -C /opt
 
       - name: Verify toolchain
         run: |
