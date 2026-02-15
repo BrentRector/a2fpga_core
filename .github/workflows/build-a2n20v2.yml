@@ -20,7 +20,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/oss-cad-suite
-          key: oss-cad-suite-linux-x64-20260214
+          key: oss-cad-suite-linux-x64-20260214-gw2ar
 
       - name: Install OSS CAD Suite
         run: |
@@ -37,6 +37,24 @@ jobs:
           fi
           echo "Verifying installation..."
           ls "$HOME/oss-cad-suite/bin/yosys"
+
+      - name: Patch Apycula for GW2AR-18C device
+        run: |
+          # Apycula only ships GW2A-18C.pickle (no 'R' variant), but the
+          # GW2AR-18C (SiP with SDRAM) has identical FPGA fabric. The Gowin
+          # Programmer requires the device name to match, so gowin_pack must
+          # be called with -d GW2AR-18C. Create a symlink so it finds the
+          # pickle under the GW2AR-18C name.
+          source ~/oss-cad-suite/environment
+          APYCULA_DIR=$(python3 -c "import apycula, os; print(os.path.dirname(apycula.__file__))")
+          echo "Apycula dir: $APYCULA_DIR"
+          if [ -f "$APYCULA_DIR/GW2A-18C.pickle" ] && [ ! -e "$APYCULA_DIR/GW2AR-18C.pickle" ]; then
+            ln -s GW2A-18C.pickle "$APYCULA_DIR/GW2AR-18C.pickle"
+            echo "Created symlink: GW2AR-18C.pickle -> GW2A-18C.pickle"
+          else
+            echo "Pickle files present:"
+            ls -la "$APYCULA_DIR/"*18C*.pickle 2>/dev/null || echo "  (none found)"
+          fi
 
       - name: Verify toolchain
         run: |
@@ -85,7 +103,7 @@ jobs:
         working-directory: boards/a2n20v2
         run: |
           source ~/oss-cad-suite/environment
-          gowin_pack -d GW2A-18C -o a2n20v2.fs a2n20v2_pnr.json
+          gowin_pack -d GW2AR-18C -o a2n20v2.fs a2n20v2_pnr.json
           echo "=== Bitstream generated ==="
           ls -la a2n20v2.fs
 
