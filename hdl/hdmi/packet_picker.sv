@@ -133,7 +133,15 @@ auxiliary_video_information_info_frame #(
     // CTA-861 requires PICTURE_ASPECT_RATIO to match the VIC.
     // VIC 2 = 4:3, VIC 3 = 16:9.  Leaving this at "no data" (2'b00)
     // caused some HDMI sinks (e.g. Ingnok) to reject the signal.
-    .PICTURE_ASPECT_RATIO(VIDEO_ID_CODE == 3 ? 2'b10 : 2'b01)
+    .PICTURE_ASPECT_RATIO(VIDEO_ID_CODE == 3 ? 2'b10 : 2'b01),
+    // Samsung TVs require ACTIVE_FORMAT_INFO_PRESENT=1 with R3-R0=1000
+    // ("same as coded frame") or they may reject the signal.
+    .ACTIVE_FORMAT_INFO_PRESENT(1'b1),
+    // Tell the sink this is underscan content (pixel-accurate, no overscan).
+    .SCAN_INFO(2'b10),
+    // Explicitly signal full-range RGB (0-255). Samsung TVs need this
+    // rather than relying on the IT_CONTENT flag to imply full range.
+    .RGB_QUANTIZATION_RANGE(2'b10)
 ) auxiliary_video_information_info_frame(.header(headers[130]), .sub(subs[130]));
 
 
