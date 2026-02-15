@@ -381,14 +381,77 @@ If the HDMI output is still not working despite the RTL being correct, the follo
 
 ---
 
-## 10. Recommended Next Steps
+## 10. HDMI vs DVI Mode Failure Analysis (Follow-up)
 
-1. **If using a2n20v2/a2n20v1/a2n9:** Investigate PLL cascade jitter. Try routing the 27 MHz crystal directly to both `clk_logic` and `clk_hdmi` PLLs instead of cascading them.
+**Observation:** DVI mode (DVI_OUTPUT=1) produces video on the Ingnok flat panel,
+but HDMI mode (DVI_OUTPUT=0) does not. Samsung Odyssey G9 fails in both modes.
 
-2. **If using a2mega:** Verify whether the TMDS clock pair needs inversion by testing with `tmdsClk` instead of `clk_pixel_w` in the ELVDS buffer.
+### What differs in HDMI mode
 
-3. **For all boards:** Verify physical pin assignments against the PCB schematic. Confirm differential pair ordering (P before N in `IO_LOC`).
+When `DVI_OUTPUT=0`, the following additional logic is activated:
+- Video preambles (8-pixel control sequences before video guard bands)
+- Video guard bands (2-pixel fixed TMDS patterns before active video)
+- Data island preambles (8-pixel control sequences before data islands)
+- Data island guard bands (2-pixel TERC4/guard patterns)
+- Data island periods (96 pixels per H blank = 3 × 32-pixel packets)
+- TERC4 encoding for data islands
+- Packet generation: AVI InfoFrame, Audio InfoFrame, ACR, SPD, audio samples, null
 
-4. **For monitors rejecting the signal:** Try DVI_OUTPUT=1 as a diagnostic (removes InfoFrames that monitors might choke on) or try a different VIDEO_ID_CODE (VIC 1 = 640×480 is the most universally supported mode).
+### Issues found in the HDMI packet layer
+
+**Issue 1: Null packet and ACR header use `X` (don't-care) values in synthesis.**
+Files: `packet_picker.sv:42-46`, `audio_clock_regeneration_packet.sv:63`
+
+The null packet header bytes HB1/HB2 and all subpacket data were assigned `8'dX`
+/ `56'dX`. While the HDMI spec says sinks "shall ignore" these bytes, the BCH ECC
+is computed over whatever values the synthesizer substitutes for `X`. If the
+synthesizer's optimization produces values inconsistent between the data path and
+the ECC path, every null packet would have a BCH error. Some HDMI sinks may
+reject a signal with persistent ECC errors.
+
+**Fix:** Changed all `X` values to deterministic `0` values.
+
+**Issue 2: `packet_type` set to `X` on `video_field_end`.**
+File: `packet_picker.sv:163`
+
+On each `video_field_end` event, `packet_type` was reset to `8'dx`. This causes
+`headers[X]` and `subs[X]` to produce undefined mux outputs during the brief
+window between video_field_end and the next packet_enable. While this window
+doesn't overlap with data island periods, the combinational mux glitch propagates
+to the packet_assembler's BCH computation inputs.
+
+**Fix:** Changed to `8'd0` (null packet type).
+
+**Issue 3: AVI InfoFrame PICTURE_ASPECT_RATIO left at "no data".**
+File: `packet_picker.sv:130-133`
+
+The AVI InfoFrame was instantiated with only `VIDEO_ID_CODE` and `IT_CONTENT`
+overridden. `PICTURE_ASPECT_RATIO` defaulted to `2'b00` ("no data"). Per CTA-861,
+VIC 2 requires 4:3 aspect ratio (`2'b01`) and VIC 3 requires 16:9 (`2'b10`).
+Some HDMI sinks validate that the aspect ratio in the InfoFrame is consistent
+with the declared VIC, and reject signals where it's missing.
+
+**Fix:** Set `PICTURE_ASPECT_RATIO` to `2'b01` (4:3) for VIC 2.
+
+### Samsung Odyssey G9 — separate issue
+
+The Samsung fails in BOTH DVI and HDMI modes. Since DVI mode works on the Ingnok
+(proving basic TMDS signaling is correct), the Samsung issue is at a different
+level. Possible causes:
+- Samsung requires DDC/EDID negotiation before accepting HDMI input
+- TMDS differential voltage swing too low for Samsung's receiver
+- Samsung firmware doesn't support 480p (VIC 2) at all over its HDMI port
+- Samsung requires HPD (Hot Plug Detect) signaling
+
+### Recommended next steps
+
+1. Test with the fixes above (null packet cleanup + aspect ratio) on the Ingnok
+2. If Ingnok still rejects HDMI mode, try setting `VIDEO_ID_CODE` to 0 in the
+   AVI InfoFrame only (while keeping timing at VIC 2) — this tells the sink to
+   treat the signal as IT/PC timing rather than a CEA mode
+3. For Samsung: compare the A2DVI output parameters (VIC, resolution, pixel clock)
+   against the A2FPGA output to identify what A2DVI does differently
+4. Measure TMDS differential voltage on the physical HDMI connector with an
+   oscilloscope
 
 5. **Measure TMDS differential swing** with an oscilloscope to confirm adequate voltage levels.
