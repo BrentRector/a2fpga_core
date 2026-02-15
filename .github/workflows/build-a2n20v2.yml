@@ -85,7 +85,7 @@ jobs:
         working-directory: boards/a2n20v2
         run: |
           source ~/oss-cad-suite/environment
-          gowin_pack -d GW2A-18C -o a2n20v2.fs a2n20v2_pnr.json
+          gowin_pack -d GW2AR-18C -o a2n20v2.fs a2n20v2_pnr.json
           echo "=== Bitstream generated ==="
           ls -la a2n20v2.fs
 
