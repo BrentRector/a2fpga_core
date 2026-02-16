@@ -172,6 +172,8 @@ module apple_memory #(
     assign a2mem_if.keycode = keycode_r;
     assign a2mem_if.keypress_strobe = keypress_strobe_r;
 
+    wire [31:0] write_word = {a2bus_if.data, a2bus_if.data, a2bus_if.data, a2bus_if.data};
+
     // ------------------------------------------------
     // Videx VideoTerm passive monitoring
     // ------------------------------------------------
@@ -290,8 +292,6 @@ module apple_memory #(
     // 16'h7FFF = 16'b0111_1111_1111_1111 (0x9FFF)
 
     wire E1 = aux_mem_r || a2bus_if.m2b0;
-
-    wire [31:0] write_word = {a2bus_if.data, a2bus_if.data, a2bus_if.data, a2bus_if.data};
 
     // Apple II bus address ranges
     wire bus_addr_0400_0BFF = a2bus_if.addr[15:10] inside {6'b000001, 3'b000010};
