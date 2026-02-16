@@ -534,14 +534,13 @@ The CPU sees only a 512-byte window at $CC00-$CDFF. The bank is selected by bits
 
 VRAM write formula: `vram[bankofs + (bus_addr & 0x1FF)] = data`
 
-### AD4: Display geometry — 7-pixel rendering (560px wide, matching Apple II)
-- Videx chars are 8px wide, but rendering all 8 would need 640px (incompatible with 28-step pipeline at current borders)
-- Use only bits [6:0] of ROM data → 7 pixels/char → 560px → same borders as Apple II
-- Vertical: **8 scanlines per row** to fit the standard 384-pixel window (192 content lines doubled). 8 × 24 rows = 192. The 9th scanline (usually blank character spacing) is dropped. This avoids changing V_BORDER or the video_active_o signal. Row and scanline are computed directly from window_y_w: `row = window_y_w[7:3]`, `scanline = window_y_w[2:0]`
+### AD4: Display geometry — 7-pixel horizontal, 9-scanline vertical
+- **Horizontal:** Videx chars are 8px wide, but rendering all 8 would need 640px (incompatible with 28-step pipeline at current borders). Use only bits [6:0] of ROM data → 7 pixels/char → 4 chars × 7px = 28 pixels per pipeline cycle → 560px → same H_BORDER as Apple II. See Part 10 for detailed limitation analysis.
+- **Vertical:** Full 9 scanlines per row. 9 × 24 rows = 216 content lines × 2 (doubling) = 432 pixels. Dynamic V_BORDER: VIDEX_V_BORDER = 24 (vs standard V_BORDER = 48). The `y_active_w` signal switches between standard and Videx vertical windows based on mode. Row and scanline computed via multiply-shift divide-by-9: `row = (content_y * 57) >> 9`, `scanline = content_y - row * 9`.
 
-### AD5: Auto-detect Videx mode from CRTC register writes
-- Sticky flag set on first write to $C0Bx, cleared on device reset
-- $C0B0-$C0BF are slot 3 I/O space — never used by normal Apple IIe software
+### AD5: Videx mode detection — sticky CRTC flag + AN0 gating
+- Sticky flag (`videx_mode_r`) set on first write to $C0Bx, cleared on device reset. $C0B0-$C0BF are slot 3 I/O space — never used by normal Apple IIe software.
+- Runtime mode switching via AN0 ($C058/$C059): Videx rendering only active when `videx_mode_r && text_mode_r && AN0`. The $C058/$C059 soft switches (annunciator 0) are monitored as `an0_r`, latched during blanking. This matches A2DVI's `SOFTSW_VIDEX_80COL` behavior and allows proper switching between Videx 80-column and standard Apple II display without requiring a reset.
 
 ### AD6: Character ROM format — 16 bytes/char, MSB = leftmost pixel
 - ROM address: `{char[7:0], scanline[3:0]}` = 12 bits, 4096 entries
@@ -677,3 +676,70 @@ Add Videx signals to interface and both modports (master=output, slave=input).
 1. **Phase 1:** Run Videx software on Apple II with A2DVI in slot 3. Check debug overlay shows correct CRTC register values and VRAM data matches expected text across all 4 banks.
 2. **Phase 2:** Verify 80-column text appears on A2FPGA HDMI output. Compare character rendering against A2DVI's own HDMI output. Test TEXT40, TEXT80, LORES, HIRES modes still work when VIDEX_MODE is inactive.
 3. **Phase 3:** Verify cursor position, blink modes, and scrolling. Test with ProTERM, Apple Writer, and Videx ROM self-test.
+
+---
+
+## Part 10: Known Limitations and Rationale
+
+This section documents three known limitations in the current Videx implementation, their practical effects, the engineering rationale for each decision, and the complexity of fixing them in the future.
+
+### 10.1 Seven-Pixel Character Width (AD4)
+
+**Limitation:** Each Videx character is rendered at 7 pixels wide instead of the true 8 pixels defined by the MC6845 CRTC and the character ROM data.
+
+**Root Cause — Pipeline Architecture Constraint:** The `apple_video.sv` rendering engine uses a fixed 28-step state machine that processes exactly 28 pixels per pipeline cycle. All existing Apple II display modes (TEXT40, TEXT80, LORES, HIRES, and their 80-column variants) are designed around this 28-pixel quantum. In the Videx pipeline, 4 characters are processed per cycle: 4 × 7 = 28 pixels, fitting perfectly. Using the full 8 pixels per character would require 4 × 8 = 32 pixels per cycle, which would break the pipeline timing and require fundamental changes to the state machine, pixel buffer width (`PIX_BUFFER_SIZE`), and all existing display modes.
+
+**Practical Effect:** The rightmost pixel column of each character glyph (bit 0 of each ROM byte) is dropped. For the vast majority of characters — all alphanumeric characters, punctuation, and common symbols — this column is blank padding in the Videx character ROM, so the visual difference is imperceptible.
+
+**Where It Matters:** The primary impact is on box-drawing and line-drawing characters in the range `$10-$1F`. These characters use all 8 pixel columns to create continuous horizontal lines. With only 7 pixels rendered, horizontal lines in box-drawing characters will have a 1-pixel gap between adjacent characters. This affects:
+- Terminal programs that draw screen borders (e.g., ProTERM's UI frames)
+- Spreadsheet programs with cell borders
+- Any software using the Videx extended character set for line art
+
+Standard text display (letters, numbers, punctuation) is unaffected because these characters have blank right-edge columns in the ROM data.
+
+**Fix Complexity: HIGH.** Would require redesigning the pipeline to support a 32-step cycle or a variable-width step, changing `STEP_LENGTH`, `PIX_BUFFER_SIZE`, pixel shift register width, and H_BORDER calculations. All existing display modes would need re-validation. This is a fundamental architectural change, not a localized fix.
+
+### 10.2 VRAM Word Alignment Assumption
+
+**Limitation:** The display start address (CRTC registers R12/R13) is assumed to be a multiple of 4. If software sets R12/R13 to a non-aligned value, characters within each 4-character read group may appear in the wrong order.
+
+**Root Cause — sdpram32 Memory Architecture:** The Videx VRAM shadow uses `sdpram32`, a 32-bit-wide Simple Dual Port RAM. Each read returns 4 bytes (4 characters) simultaneously at a word-aligned address. The current pipeline reads characters in groups of 4 and processes them sequentially across pipeline stages (`STAGE_VIDEX_0` through `STAGE_VIDEX_5`). The byte extraction logic assumes character 0 is at bits [7:0], character 1 at [15:8], etc., which is only correct when the base address is 4-byte aligned.
+
+**Practical Effect:** If R12/R13 is set to, say, address `0x001` (offset by 1), the pipeline would still read the word at address `0x000` and treat byte 0 as the first character, when it should start with byte 1. This would cause the entire display to be shifted by 1-3 character positions within each group of 4.
+
+**When This Occurs:** In practice, the Videx VideoTerm firmware and essentially all known Videx-compatible software initialize R12/R13 to `0x0000` and scroll by full row widths (80 characters). Since 80 is a multiple of 4, scrolling by row increments always maintains alignment. The only scenario where misalignment would occur is if software performed smooth horizontal scrolling by single-character increments, which is technically possible but not known to be used by any real Videx software.
+
+**Fix Complexity: MEDIUM.** Would require adding a 2-bit offset register derived from `R12_R13 & 2'b11`, then using that offset to rotate the byte extraction from the 32-bit word. Approximately 20-30 additional LUTs for barrel-shifting the 4 bytes. The pipeline stage assignments would also need adjustment to handle the wrap-around case where one read group spans two words.
+
+### 10.3 R9 (Max Scanline) Hardcoded to 8
+
+**Limitation:** The number of scanlines per character row is fixed at 9 (R9 value of 8, meaning scanlines 0-8). The actual value of CRTC register R9 is captured from the bus but not used for rendering.
+
+**Root Cause — Divide-by-9 Implementation:** The vertical position calculation uses a compile-time divide-by-9 via the multiply-shift trick: `row = (content_y * 57) >> 9`. This produces exact integer division by 9 for all content_y values from 0 to 215 (24 rows × 9 scanlines - 1). Making this dynamic would require either:
+- A variable-divisor implementation (expensive in FPGA fabric — typically uses iterative subtraction or lookup tables)
+- A set of parallel multiply-shift circuits for each possible R9 value with a mux to select the active one
+
+Additionally, the vertical display geometry (`VIDEX_WINDOW_HEIGHT = 432`, `VIDEX_V_BORDER = 24`) is computed based on 9 scanlines per row. A different R9 value would change the total content height and require dynamic border adjustment.
+
+**Practical Effect:** If software sets R9 to a value other than 8, characters would render with incorrect vertical spacing:
+- R9 < 8: Character rows would overlap, causing garbled vertical display
+- R9 > 8: Extra blank scanlines would appear between character rows, and the display would extend beyond the expected vertical window
+
+**When This Occurs:** The Videx VideoTerm firmware always initializes R9 to `0x08` (9 scanlines, matching the 9×8 pixel character cell). The character ROM is designed around this geometry. No known Videx software changes R9 after initialization. Some theoretical use cases (custom character heights for graphics modes or reduced-height fonts) could set different R9 values, but these are not found in the real-world Videx software library.
+
+**Fix Complexity: MEDIUM-HIGH.** Would require:
+1. A parameterizable divider or lookup table for the row/scanline computation (~50-100 LUTs)
+2. Dynamic `VIDEX_WINDOW_HEIGHT` and `VIDEX_V_BORDER` based on R9 and R6 (vertical displayed)
+3. Re-validation of the `y_active_w` window signal for all possible R9 values
+4. Potential timing issues if the divide path becomes too long for one clock cycle
+
+### 10.4 Summary
+
+| Limitation | Affected Use Case | Frequency in Real Software | Fix Complexity |
+|---|---|---|---|
+| 7-pixel character width | Box-drawing chars ($10-$1F) | Occasional (terminal UI borders) | HIGH (pipeline redesign) |
+| VRAM word alignment | Non-4-aligned R12/R13 scroll | Extremely rare (no known software) | MEDIUM (barrel shift) |
+| R9 hardcoded to 8 | Non-standard character height | Extremely rare (no known software) | MEDIUM-HIGH (variable divider) |
+
+All three limitations represent deliberate engineering trade-offs that prioritize compatibility with the existing pipeline architecture and real-world Videx software behavior. The 7-pixel limitation has the most visible effect but is architecturally the hardest to fix. The other two limitations are unlikely to manifest with any known Videx software.
