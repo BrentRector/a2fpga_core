@@ -214,10 +214,12 @@ module top #(
     wire video_rd_w;
     wire [31:0] video_data_w;
 
-    apple_memory apple_memory (
+    apple_memory #(
+        .VIDEX_SUPPORT(0)
+    ) apple_memory (
         .a2bus_if(a2bus_if),
         .a2mem_if(a2mem_if),
-        
+
         .video_address_i(video_address_w),
         .video_rd_i(video_rd_w),
         .video_data_o(video_data_w),
@@ -225,7 +227,11 @@ module top #(
         .vgc_active_i('0),
         .vgc_address_i('0),
         .vgc_rd_i('0),
-        .vgc_data_o()
+        .vgc_data_o(),
+
+        .videx_vram_addr_i(9'b0),
+        .videx_vram_rd_i(1'b0),
+        .videx_vram_data_o()
     );
 
     // Slots
@@ -286,6 +292,10 @@ module top #(
         .video_bank_o(video_bank_w),
         .video_rd_o(video_rd_w),
         .video_data_i(video_data_w),
+
+        .videx_vram_addr_o(),
+        .videx_vram_rd_o(),
+        .videx_vram_data_i(32'b0),
 
         .video_active_o(apple_vga_active),
         .video_r_o(apple_vga_r),

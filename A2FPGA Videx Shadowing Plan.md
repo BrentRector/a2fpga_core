@@ -537,7 +537,7 @@ VRAM write formula: `vram[bankofs + (bus_addr & 0x1FF)] = data`
 ### AD4: Display geometry — 7-pixel rendering (560px wide, matching Apple II)
 - Videx chars are 8px wide, but rendering all 8 would need 640px (incompatible with 28-step pipeline at current borders)
 - Use only bits [6:0] of ROM data → 7 pixels/char → 560px → same borders as Apple II
-- Vertical: 9 scanlines × 24 rows = 216 lines, doubled = 432px. V_BORDER = 24
+- Vertical: **8 scanlines per row** to fit the standard 384-pixel window (192 content lines doubled). 8 × 24 rows = 192. The 9th scanline (usually blank character spacing) is dropped. This avoids changing V_BORDER or the video_active_o signal. Row and scanline are computed directly from window_y_w: `row = window_y_w[7:3]`, `scanline = window_y_w[2:0]`
 
 ### AD5: Auto-detect Videx mode from CRTC register writes
 - Sticky flag set on first write to $C0Bx, cleared on device reset
@@ -548,6 +548,46 @@ VRAM write formula: `vram[bankofs + (bus_addr & 0x1FF)] = data`
 - Characters 0x00-0x7F = normal set, 0x80-0xFF = inverse set
 - Inverse ROM has pre-inverted pixel data (not computed at runtime)
 - No inversion (~) applied at read time (unlike Apple II viderom which inverts)
+
+### AD7: Behavior when no Videx card is present
+
+When no Videx VideoTerm (or compatible/emulated card like A2DVI) is installed in slot 3, A2FPGA must behave exactly as if Videx support does not exist — no visual artifacts, no mode switches, no wasted cycles.
+
+**Runtime behavior (VIDEX_SUPPORT=1, no card installed):**
+
+- **VIDEX_MODE stays false.** The auto-detection flag (`videx_crtc_write_detected`) is only set by CPU writes to `$C0B0-$C0BF` (slot 3 device I/O). Without a Videx card, no driver software will write to these addresses, so the flag is never set and the rendering pipeline never enters `VIDEX_LINE` mode.
+- **No false triggers.** `$C0B0-$C0BF` is slot 3's dedicated device I/O space. The Apple IIe's built-in 80-column firmware uses entirely different addresses (`$C07x`, `$C00x`). No standard Apple II software writes to slot 3 I/O unless it specifically targets slot 3 hardware.
+- **Rendering is unaffected.** The `line_type_w` mux checks `videx_mode_r` first — when false, it falls through to standard TEXT40/TEXT80/LORES/HIRES selection as normal.
+- **VRAM and CRTC registers are idle but allocated.** The 1 BSRAM block for VRAM shadow and the flip-flops for CRTC registers are still instantiated. They consume no dynamic power (no writes occur), but they do consume static silicon resources.
+- **Character ROM LUT RAM is idle but allocated.** The 4 KB LUT RAM array is synthesized and initialized from the hex file. It consumes ~150 SSRAM units of logic budget but is never read.
+
+**Compile-time parameter (VIDEX_SUPPORT=0):**
+
+For builds where Videx support is not wanted (e.g., to reclaim the 1 BSRAM block for other peripherals), a compile-time parameter should gate all Videx hardware:
+
+```systemverilog
+parameter VIDEX_SUPPORT = 1  // Set to 0 to eliminate all Videx hardware
+```
+
+When `VIDEX_SUPPORT=0`:
+- No CRTC register capture logic (saves ~18 flip-flops + decode logic)
+- No VRAM BSRAM block instantiated (saves 1 BSRAM block)
+- No character ROM LUT RAM (saves ~150 SSRAM units)
+- No `VIDEX_MODE` detection logic
+- `VIDEX_MODE` signal hardwired to `1'b0`
+- All Videx-related `a2mem_if` signals tied to constant zero
+- The `VIDEX_LINE` path in `apple_video.sv` is dead code and optimized away by synthesis
+
+This parameter should be set in `top.sv` and threaded through `apple_memory` and `apple_video` module instantiations.
+
+**Summary:**
+
+| Scenario | VIDEX_MODE | Resources Used | Rendering |
+|----------|-----------|----------------|-----------|
+| Videx card present, 80-col active | `true` | All Videx hardware active | Videx 80-column text |
+| Videx card present, 40-col mode | `false` | VRAM/CRTC captured but not rendered | Standard Apple II modes |
+| No Videx card installed | `false` (never set) | Hardware allocated but idle | Standard Apple II modes |
+| `VIDEX_SUPPORT=0` (compile-time) | hardwired `0` | No Videx hardware synthesized | Standard Apple II modes only |
 
 ---
 
