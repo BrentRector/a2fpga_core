@@ -644,8 +644,10 @@ module top #(
     );
 
     // Gowin LVDS output buffer
+    // Use serialized tmdsClk (from OSER10) instead of raw clk_pixel_w
+    // to ensure clock-data phase alignment on the TMDS link.
     ELVDS_TBUF tmds_bufds[3:0] (
-        .I({clk_pixel_w, tmds}),
+        .I({tmdsClk, tmds}),
         .O({tmds_clk_p, tmds_d_p}),
         .OB({tmds_clk_n, tmds_d_n}),
         .OEN(sleep_w && HDMI_SLEEP_ENABLE)

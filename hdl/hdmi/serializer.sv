@@ -144,7 +144,7 @@ module serializer
           .FCLK( clk_pixel_x5 ),
           .RESET( reset ) );
 
-        OSER10 gwSer2( 
+        OSER10 gwSer2(
           .Q( tmds[ 2 ] ),
           .D0( tmds_internal[ 2 ][ 0 ] ),
           .D1( tmds_internal[ 2 ][ 1 ] ),
@@ -159,8 +159,27 @@ module serializer
           .PCLK( clk_pixel ),
           .FCLK( clk_pixel_x5 ),
           .RESET( reset ) );
-          
-        assign tmds_clock = clk_pixel;
+
+        // Serialize the TMDS clock through OSER10 to ensure proper
+        // phase alignment with the data channels. Using the raw pixel
+        // clock directly causes clock-data skew because the data is
+        // driven by PLL2 (FCLK) while the raw clock is from PLL1.
+        // Pattern 0000011111 produces a pixel-rate clock aligned to FCLK.
+        OSER10 gwSerClk(
+          .Q( tmds_clock ),
+          .D0( 1'b1 ),
+          .D1( 1'b1 ),
+          .D2( 1'b1 ),
+          .D3( 1'b1 ),
+          .D4( 1'b1 ),
+          .D5( 1'b0 ),
+          .D6( 1'b0 ),
+          .D7( 1'b0 ),
+          .D8( 1'b0 ),
+          .D9( 1'b0 ),
+          .PCLK( clk_pixel ),
+          .FCLK( clk_pixel_x5 ),
+          .RESET( reset ) );
   
     `else
         logic [9:0] tmds_reversed [NUM_CHANNELS-1:0];
