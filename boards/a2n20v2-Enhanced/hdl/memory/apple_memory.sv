@@ -185,7 +185,7 @@ module apple_memory #(
 
             // CRTC register index and register file
             reg [4:0] videx_crtc_idx;
-            reg [7:0] videx_crtc_regs[16];
+            reg [7:0] videx_crtc_regs[18];
             reg [10:0] videx_bankofs;  // VRAM bank offset (0x000, 0x200, 0x400, 0x600)
 
             // Mode detection: sticky flag set on first CRTC write
@@ -196,7 +196,7 @@ module apple_memory #(
                     videx_crtc_idx <= 5'h0;
                     videx_bankofs <= 11'h0;
                     videx_mode_r <= 1'b0;
-                    for (int i = 0; i < 16; i++)
+                    for (int i = 0; i < 18; i++)
                         videx_crtc_regs[i] <= 8'h00;
                 end else if ((a2bus_if.phi1_posedge) && !a2bus_if.m2sel_n &&
                              (a2bus_if.addr[15:4] == 12'hC0B)) begin
@@ -204,7 +204,7 @@ module apple_memory #(
                     videx_bankofs <= {a2bus_if.addr[3:2], 9'b0};  // bits [3:2] x 512
 
                     // CRTC register capture on writes only
-                    if (!a2bus_if.rw_n) begin
+                    if (!a2bus_if.rw_n && a2bus_if.data_in_strobe) begin
                         videx_mode_r <= 1'b1;  // Videx detected
                         if (!a2bus_if.addr[0])  // even address = index select
                             videx_crtc_idx <= a2bus_if.data[4:0];

@@ -25,7 +25,9 @@
 // concurrent access to the SDRAM by other modules in the design.
 //
 
-module apple_video (
+module apple_video #(
+    parameter VIDEX_SUPPORT = 0  // 1 = enable Videx VideoTerm 80-column rendering
+) (
     a2bus_if.slave a2bus_if,
     a2mem_if.slave a2mem_if,
 
@@ -139,7 +141,7 @@ module apple_video (
             monochrome_dhires_mode_r    <= video_control_if.monochrome_dhires_mode(a2mem_if.MONOCHROME_DHIRES_MODE);
             shrg_mode_r                 <= video_control_if.shrg_mode(a2mem_if.SHRG_MODE);
 
-            videx_mode_r                <= a2mem_if.VIDEX_MODE;
+            videx_mode_r                <= VIDEX_SUPPORT ? a2mem_if.VIDEX_MODE : 1'b0;
         end
     end
 
@@ -148,16 +150,27 @@ module apple_video (
     reg [7:0] videx_r10_r, videx_r11_r;
     reg [7:0] videx_r12_r, videx_r13_r, videx_r14_r, videx_r15_r;
 
-    always @(posedge a2bus_if.clk_pixel) begin
-        if (blanking_active_w) begin
-            videx_r10_r <= a2mem_if.VIDEX_CRTC_R10;
-            videx_r11_r <= a2mem_if.VIDEX_CRTC_R11;
-            videx_r12_r <= a2mem_if.VIDEX_CRTC_R12;
-            videx_r13_r <= a2mem_if.VIDEX_CRTC_R13;
-            videx_r14_r <= a2mem_if.VIDEX_CRTC_R14;
-            videx_r15_r <= a2mem_if.VIDEX_CRTC_R15;
+    generate if (VIDEX_SUPPORT) begin : videx_regs_gen
+        always @(posedge a2bus_if.clk_pixel) begin
+            if (blanking_active_w) begin
+                videx_r10_r <= a2mem_if.VIDEX_CRTC_R10;
+                videx_r11_r <= a2mem_if.VIDEX_CRTC_R11;
+                videx_r12_r <= a2mem_if.VIDEX_CRTC_R12;
+                videx_r13_r <= a2mem_if.VIDEX_CRTC_R13;
+                videx_r14_r <= a2mem_if.VIDEX_CRTC_R14;
+                videx_r15_r <= a2mem_if.VIDEX_CRTC_R15;
+            end
         end
-    end
+    end else begin : no_videx_regs_gen
+        always @(posedge a2bus_if.clk_pixel) begin
+            videx_r10_r <= 8'h0;
+            videx_r11_r <= 8'h0;
+            videx_r12_r <= 8'h0;
+            videx_r13_r <= 8'h0;
+            videx_r14_r <= 8'h0;
+            videx_r15_r <= 8'h0;
+        end
+    end endgenerate
 
     // Videx geometry: 9 scanlines per row × 24 rows = 216 content lines × 2 (doubling) = 432 pixels.
     wire [10:0] videx_text_base_w = {videx_r12_r[2:0], videx_r13_r};
@@ -193,13 +206,17 @@ module apple_video (
     reg [7:0] viderom_d_r;
     always @(posedge a2bus_if.clk_pixel) viderom_d_r <= ~viderom_r[viderom_a_r];
 
-    // Videx character ROM (4 KB in LUT RAM, 0 BSRAM blocks)
-    // 256 characters × 16 bytes/char: chars 0x00-0x7F = normal, 0x80-0xFF = inverse (pre-inverted)
-    reg [7:0] videxrom_r[4095:0];
-    initial $readmemh("videx_charrom.hex", videxrom_r, 0);
+    // Videx character ROM — only instantiated when VIDEX_SUPPORT is enabled (saves ~150 SSRAM units)
     reg [11:0] videxrom_a_r;
     reg [7:0] videxrom_d_r;
-    always @(posedge a2bus_if.clk_pixel) videxrom_d_r <= videxrom_r[videxrom_a_r];
+    generate if (VIDEX_SUPPORT) begin : videx_rom_gen
+        // 256 characters × 16 bytes/char: chars 0x00-0x7F = normal, 0x80-0xFF = inverse (pre-inverted)
+        reg [7:0] videxrom_r[4095:0];
+        initial $readmemh("videx_charrom.hex", videxrom_r, 0);
+        always @(posedge a2bus_if.clk_pixel) videxrom_d_r <= videxrom_r[videxrom_a_r];
+    end else begin : no_videx_rom_gen
+        always @(posedge a2bus_if.clk_pixel) videxrom_d_r <= 8'h0;
+    end endgenerate
 
     reg [22:0] flash_cnt_r;
     always @(posedge a2bus_if.clk_pixel) flash_cnt_r <= flash_cnt_r + 1'b1;

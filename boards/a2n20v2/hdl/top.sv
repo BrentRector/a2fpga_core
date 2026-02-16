@@ -300,7 +300,9 @@ module top #(
     wire [7:0] apple_vga_g;
     wire [7:0] apple_vga_b;
 
-    apple_video apple_video (
+    apple_video #(
+        .VIDEX_SUPPORT(1)
+    ) apple_video (
         .a2bus_if(a2bus_if),
         .a2mem_if(a2mem_if),
 
