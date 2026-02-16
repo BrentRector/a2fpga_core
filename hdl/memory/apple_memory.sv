@@ -200,7 +200,7 @@ module apple_memory #(
                     videx_bankofs <= {a2bus_if.addr[3:2], 9'b0};  // bits [3:2] × 512
 
                     // CRTC register capture on writes only
-                    if (!a2bus_if.rw_n && a2bus_if.data_in_strobe) begin
+                    if (!a2bus_if.rw_n) begin
                         videx_mode_r <= 1'b1;  // Videx detected
                         if (!a2bus_if.addr[0])  // even address = index select
                             videx_crtc_idx <= a2bus_if.data[4:0];
