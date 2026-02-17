@@ -47,6 +47,16 @@ interface a2mem_if;
 
     logic [2:0] SLOTROM;
 
+    // Videx VideoTerm signals
+    logic VIDEX_MODE;
+    logic [7:0] VIDEX_CRTC_R9;     // Max Scan Line Address
+    logic [7:0] VIDEX_CRTC_R10;    // Cursor start + blink mode
+    logic [7:0] VIDEX_CRTC_R11;    // Cursor end scanline
+    logic [7:0] VIDEX_CRTC_R12;    // Display start addr high
+    logic [7:0] VIDEX_CRTC_R13;    // Display start addr low
+    logic [7:0] VIDEX_CRTC_R14;    // Cursor addr high
+    logic [7:0] VIDEX_CRTC_R15;    // Cursor addr low
+
     // IIgs configuration
     logic [3:0] TEXT_COLOR;
     logic [3:0] BACKGROUND_COLOR;
@@ -84,6 +94,15 @@ interface a2mem_if;
 
         output SLOTROM,
 
+        output VIDEX_MODE,
+        output VIDEX_CRTC_R9,
+        output VIDEX_CRTC_R10,
+        output VIDEX_CRTC_R11,
+        output VIDEX_CRTC_R12,
+        output VIDEX_CRTC_R13,
+        output VIDEX_CRTC_R14,
+        output VIDEX_CRTC_R15,
+
         output TEXT_COLOR,
         output BACKGROUND_COLOR,
         output BORDER_COLOR,
@@ -120,6 +139,15 @@ interface a2mem_if;
         input INTC8ROM,
 
         input SLOTROM,
+
+        input VIDEX_MODE,
+        input VIDEX_CRTC_R9,
+        input VIDEX_CRTC_R10,
+        input VIDEX_CRTC_R11,
+        input VIDEX_CRTC_R12,
+        input VIDEX_CRTC_R13,
+        input VIDEX_CRTC_R14,
+        input VIDEX_CRTC_R15,
 
         input TEXT_COLOR,
         input BACKGROUND_COLOR,

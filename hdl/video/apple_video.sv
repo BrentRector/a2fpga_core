@@ -25,7 +25,9 @@
 // concurrent access to the SDRAM by other modules in the design.
 //
 
-module apple_video (
+module apple_video #(
+    parameter VIDEX_SUPPORT = 0  // 1 = enable Videx VideoTerm 80-column rendering
+) (
     a2bus_if.slave a2bus_if,
     a2mem_if.slave a2mem_if,
 
@@ -42,7 +44,12 @@ module apple_video (
     output wire video_active_o,
     output [7:0] video_r_o,
     output [7:0] video_g_o,
-    output [7:0] video_b_o
+    output [7:0] video_b_o,
+
+    // Videx VRAM read port
+    output reg [8:0] videx_vram_addr_o,
+    output reg videx_vram_rd_o,
+    input [31:0] videx_vram_data_i
 );
 
     localparam FORCE_NIBBLE_COLORS = 1;
@@ -72,9 +79,19 @@ module apple_video (
     localparam [9:0] V_TOP_BORDER = V_BORDER - 1;
     localparam [9:0] V_BOTTOM_BORDER = V_BORDER + WINDOW_HEIGHT;
 
+    // Videx vertical geometry: 9 scanlines × 24 rows = 216 lines, doubled = 432 pixels
+    localparam [9:0] VIDEX_WINDOW_HEIGHT = 432;
+    localparam [9:0] VIDEX_V_BORDER = (SCREEN_HEIGHT - VIDEX_WINDOW_HEIGHT) / 2;  // 24
+    localparam [9:0] VIDEX_V_TOP_BORDER = VIDEX_V_BORDER - 1;
+    localparam [9:0] VIDEX_V_BOTTOM_BORDER = VIDEX_V_BORDER + VIDEX_WINDOW_HEIGHT;
+
     wire x_active_w = (screen_x_i > H_LEFT_BORDER) & (screen_x_i < H_RIGHT_BORDER);
     wire scan_x_active_w = (screen_x_i > (H_LEFT_BORDER - SCAN_PIX_OFFSET)) & (screen_x_i < (H_RIGHT_BORDER - SCAN_PIX_OFFSET));
-    wire y_active_w = (screen_y_i > V_TOP_BORDER) & (screen_y_i < V_BOTTOM_BORDER);
+    // Standard and Videx vertical active windows
+    wire y_active_std_w = (screen_y_i > V_TOP_BORDER) & (screen_y_i < V_BOTTOM_BORDER);
+    wire y_active_videx_w = (screen_y_i > VIDEX_V_TOP_BORDER) & (screen_y_i < VIDEX_V_BOTTOM_BORDER);
+    // Widen vertical window when Videx mode is active in text mode with AN0 set
+    wire y_active_w = (videx_mode_r & text_mode_r & an0_r) ? y_active_videx_w : y_active_std_w;
     assign video_active_o = x_active_w & y_active_w;
     wire scan_active_w = scan_x_active_w & y_active_w;
     wire generate_active_w = scan_active_w | video_active_o;
@@ -91,6 +108,7 @@ module apple_video (
     reg col80_r;
     reg store80_r;
     reg an3_r;
+    reg an0_r;
     reg altchar_r;
     reg video_bank_r;
 
@@ -113,6 +131,7 @@ module apple_video (
             col80_r                     <= video_control_if.col80(a2mem_if.COL80);
             store80_r                   <= video_control_if.store80(a2mem_if.STORE80);
             an3_r                       <= video_control_if.an3(a2mem_if.AN3);
+            an0_r                       <= a2mem_if.AN0;
             altchar_r                   <= video_control_if.altchar(a2mem_if.ALTCHAR);
 
             text_color_r                <= video_control_if.text_color(a2mem_if.TEXT_COLOR);
@@ -121,8 +140,54 @@ module apple_video (
             monochrome_mode_r           <= video_control_if.monochrome_mode(a2mem_if.MONOCHROME_MODE);
             monochrome_dhires_mode_r    <= video_control_if.monochrome_dhires_mode(a2mem_if.MONOCHROME_DHIRES_MODE);
             shrg_mode_r                 <= video_control_if.shrg_mode(a2mem_if.SHRG_MODE);
+
+            videx_mode_r                <= VIDEX_SUPPORT ? a2mem_if.VIDEX_MODE : 1'b0;
         end
     end
+
+    // Videx state latched during blanking
+    reg videx_mode_r;
+    reg [7:0] videx_r10_r, videx_r11_r;
+    reg [7:0] videx_r12_r, videx_r13_r, videx_r14_r, videx_r15_r;
+
+    generate if (VIDEX_SUPPORT) begin : videx_regs_gen
+        always @(posedge a2bus_if.clk_pixel) begin
+            if (blanking_active_w) begin
+                videx_r10_r <= a2mem_if.VIDEX_CRTC_R10;
+                videx_r11_r <= a2mem_if.VIDEX_CRTC_R11;
+                videx_r12_r <= a2mem_if.VIDEX_CRTC_R12;
+                videx_r13_r <= a2mem_if.VIDEX_CRTC_R13;
+                videx_r14_r <= a2mem_if.VIDEX_CRTC_R14;
+                videx_r15_r <= a2mem_if.VIDEX_CRTC_R15;
+            end
+        end
+    end else begin : no_videx_regs_gen
+        always @(posedge a2bus_if.clk_pixel) begin
+            videx_r10_r <= 8'h0;
+            videx_r11_r <= 8'h0;
+            videx_r12_r <= 8'h0;
+            videx_r13_r <= 8'h0;
+            videx_r14_r <= 8'h0;
+            videx_r15_r <= 8'h0;
+        end
+    end endgenerate
+
+    // Videx geometry: 9 scanlines per row × 24 rows = 216 content lines × 2 (doubling) = 432 pixels.
+    wire [10:0] videx_text_base_w = {videx_r12_r[2:0], videx_r13_r};
+    wire [10:0] videx_cursor_addr_w = {videx_r14_r[2:0], videx_r15_r};
+
+    // Videx content line after removing doubling: (screen_y - border) / 2, range 0-215
+    wire [7:0] videx_content_y_w = (screen_y_i > VIDEX_V_TOP_BORDER) ?
+        (screen_y_i - VIDEX_V_BORDER) >> 1 : 8'd0;
+
+    // Divide by 9 using multiply-shift: row = (content_y * 57) >> 9
+    // Exact for content_y 0-215 (24 rows × 9 scanlines)
+    wire [13:0] videx_div9_w = videx_content_y_w * 8'd57;
+    wire [4:0] videx_row_w = videx_div9_w[13:9];
+
+    // Scanline within row: content_y - row * 9, where row * 9 = row * 8 + row
+    wire [7:0] videx_row_x9_w = {videx_row_w[4:0], 3'b0} + {3'b0, videx_row_w[4:0]};
+    wire [3:0] videx_scanline_w = videx_content_y_w - videx_row_x9_w;
 
     wire GR = ~(text_mode_r | (window_y_w[5] & window_y_w[7] & mixed_mode_r));
 
@@ -140,6 +205,18 @@ module apple_video (
     reg [11:0] viderom_a_r;
     reg [7:0] viderom_d_r;
     always @(posedge a2bus_if.clk_pixel) viderom_d_r <= ~viderom_r[viderom_a_r];
+
+    // Videx character ROM — only instantiated when VIDEX_SUPPORT is enabled (saves ~150 SSRAM units)
+    reg [11:0] videxrom_a_r;
+    reg [7:0] videxrom_d_r;
+    generate if (VIDEX_SUPPORT) begin : videx_rom_gen
+        // 256 characters × 16 bytes/char: chars 0x00-0x7F = normal, 0x80-0xFF = inverse (pre-inverted)
+        reg [7:0] videxrom_r[4095:0];
+        initial $readmemh("videx_charrom.hex", videxrom_r, 0);
+        always @(posedge a2bus_if.clk_pixel) videxrom_d_r <= videxrom_r[videxrom_a_r];
+    end else begin : no_videx_rom_gen
+        always @(posedge a2bus_if.clk_pixel) videxrom_d_r <= 8'h0;
+    end endgenerate
 
     reg [22:0] flash_cnt_r;
     always @(posedge a2bus_if.clk_pixel) flash_cnt_r <= flash_cnt_r + 1'b1;
@@ -316,6 +393,7 @@ module apple_video (
 
     localparam [2:0] TEXT40_LINE = 0;
     localparam [2:0] TEXT80_LINE = 1;
+    localparam [2:0] VIDEX_LINE = 2;
     localparam [2:0] LORES40_LINE = 4;
     localparam [2:0] LORES80_LINE = 5;
     localparam [2:0] HIRES40_LINE = 6;
@@ -328,7 +406,7 @@ module apple_video (
 
     localparam [7:0] STAGE_LOAD_MEM = {STEP_FIRST, 3'b???};
     localparam [7:0] STAGE_LATCH_MEM = {STEP_LATCH_MEM, 3'b???};
-    localparam [7:0] STAGE_TEXT_0 = {STEP_LATCH_MEM + 5'd1, 3'b0??};
+    localparam [7:0] STAGE_TEXT_0 = {STEP_LATCH_MEM + 5'd1, 3'b00?};
     localparam [7:0] STAGE_TEXT40_1 = {STEP_LATCH_MEM + 5'd2, TEXT40_LINE};
     localparam [7:0] STAGE_TEXT40_2 = {STEP_LATCH_MEM + 5'd3, TEXT40_LINE};
     localparam [7:0] STAGE_TEXT40_3 = {STEP_LATCH_MEM + 5'd4, TEXT40_LINE};
@@ -341,14 +419,23 @@ module apple_video (
     localparam [7:0] STAGE_LORES80 = {STEP_LATCH_MEM + 5'd1, LORES80_LINE};
     localparam [7:0] STAGE_HIRES40 = {STEP_LATCH_MEM + 5'd1, HIRES40_LINE};
     localparam [7:0] STAGE_HIRES80 = {STEP_LATCH_MEM + 5'd1, HIRES80_LINE};
+    // Videx pipeline stages: 4 characters per 28-step cycle (same as TEXT80)
+    localparam [7:0] STAGE_VIDEX_0 = {STEP_LATCH_MEM + 5'd1, VIDEX_LINE};
+    localparam [7:0] STAGE_VIDEX_1 = {STEP_LATCH_MEM + 5'd2, VIDEX_LINE};
+    localparam [7:0] STAGE_VIDEX_2 = {STEP_LATCH_MEM + 5'd3, VIDEX_LINE};
+    localparam [7:0] STAGE_VIDEX_3 = {STEP_LATCH_MEM + 5'd4, VIDEX_LINE};
+    localparam [7:0] STAGE_VIDEX_4 = {STEP_LATCH_MEM + 5'd5, VIDEX_LINE};
+    localparam [7:0] STAGE_VIDEX_5 = {STEP_LATCH_MEM + 5'd6, VIDEX_LINE};
     localparam [7:0] STAGE_LOAD_SHIFT = {STEP_LAST, 3'b???};
 
-    wire [2:0] line_type_w = (!GR & !col80_r) ? TEXT40_LINE : 
-        (!GR & col80_r) ? TEXT80_LINE : 
-        (GR & !hires_mode_r & an3_r) ? LORES40_LINE : 
-        (GR & col80_r & !hires_mode_r & !an3_r) ? LORES80_LINE : 
-        (GR & !col80_r & hires_mode_r & an3_r) ? HIRES40_LINE : 
-        (GR & col80_r & hires_mode_r & !an3_r) ? HIRES80_LINE : 
+    // Videx mode takes priority when active + text mode
+    wire [2:0] line_type_w = (videx_mode_r & text_mode_r & an0_r) ? VIDEX_LINE :
+        (!GR & !col80_r) ? TEXT40_LINE :
+        (!GR & col80_r) ? TEXT80_LINE :
+        (GR & !hires_mode_r & an3_r) ? LORES40_LINE :
+        (GR & col80_r & !hires_mode_r & !an3_r) ? LORES80_LINE :
+        (GR & !col80_r & hires_mode_r & an3_r) ? HIRES40_LINE :
+        (GR & col80_r & hires_mode_r & !an3_r) ? HIRES80_LINE :
         TEXT40_LINE;
 
     wire lores_line_type_w = (line_type_w == LORES40_LINE) | (line_type_w == LORES80_LINE);
@@ -372,6 +459,39 @@ module apple_video (
 
     reg [5:0] h_offset_r;
     reg [31:0] video_data_r;
+    reg [31:0] videx_data_r;
+
+    // Videx VRAM address computation (linear, not scrambled like Apple II)
+    // row * 80 = row * 64 + row * 16
+    wire [10:0] videx_row_x80_w = ({videx_row_w, 6'd0}) + ({2'b0, videx_row_w, 4'd0});
+    wire [10:0] videx_line_start_w = (videx_text_base_w + videx_row_x80_w) & 11'h7FF;
+    // h_offset_r goes 0, 2, 4, ... Each step = 4 characters. Column = h_offset_r * 2.
+    wire [10:0] videx_char_addr_w = (videx_line_start_w + {4'b0, h_offset_r, 1'b0}) & 11'h7FF;
+
+    // Cursor matching
+    wire [10:0] videx_cursor_delta_w = (videx_cursor_addr_w - videx_char_addr_w) & 11'h7FF;
+    wire videx_cursor_in_group_w = videx_cursor_delta_w < 11'd4;
+    wire [1:0] videx_cursor_byte_w = videx_cursor_delta_w[1:0];
+    wire [1:0] videx_cursor_blink_mode_w = videx_r10_r[6:5];
+    wire [3:0] videx_cursor_start_line_w = videx_r10_r[3:0];
+    wire [3:0] videx_cursor_end_line_w = videx_r11_r[3:0];
+    // Frame counter for MC6845-accurate cursor blink rates
+    reg videx_frame_edge_r;
+    reg [5:0] videx_frame_cnt_r;
+    always @(posedge a2bus_if.clk_pixel) begin
+        videx_frame_edge_r <= (screen_y_i >= SCREEN_HEIGHT);
+        if ((screen_y_i >= SCREEN_HEIGHT) && !videx_frame_edge_r)
+            videx_frame_cnt_r <= videx_frame_cnt_r + 1'b1;
+    end
+
+    wire videx_cursor_blink_w =
+        (videx_cursor_blink_mode_w == 2'b00) ? 1'b1 :                 // always on
+        (videx_cursor_blink_mode_w == 2'b01) ? 1'b0 :                 // hidden
+        (videx_cursor_blink_mode_w == 2'b10) ? videx_frame_cnt_r[3] : // 1/16 field rate
+        videx_frame_cnt_r[4];                                          // 1/32 field rate
+    wire videx_cursor_scanline_w = (videx_scanline_w >= videx_cursor_start_line_w) &&
+                                    (videx_scanline_w <= videx_cursor_end_line_w);
+    wire videx_cursor_active_w = videx_cursor_blink_w && videx_cursor_scanline_w && videx_cursor_in_group_w;
 
     reg [PIX_BUFFER_SIZE-1:0] pix_buffer_r;
     reg [PIX_BUFFER_SIZE-1:0] pix_shift_r/* synthesis syn_srlstyle = "registers" */;
@@ -385,6 +505,7 @@ module apple_video (
         pix_shift_r <= {1'b0, pix_shift_r[PIX_BUFFER_SIZE-1:1]};
 
         video_rd_o <= 1'b0;
+        videx_vram_rd_o <= 1'b0;
 
         if (!scan_active_w) begin
             h_offset_r <= '0;
@@ -395,13 +516,21 @@ module apple_video (
             case (pix_stage_w) inside
                 // start read
                 STAGE_LOAD_MEM: begin
-                    video_address_o <= lineaddr(window_y_w) + h_offset_r;
-                    video_bank_o <= video_bank_r;
-                    video_rd_o <= 1'b1;
+                    if (line_type_w == VIDEX_LINE) begin
+                        videx_vram_addr_o <= videx_char_addr_w[10:2];
+                        videx_vram_rd_o <= 1'b1;
+                    end else begin
+                        video_address_o <= lineaddr(window_y_w) + h_offset_r;
+                        video_bank_o <= video_bank_r;
+                        video_rd_o <= 1'b1;
+                    end
                 end
                 // latch data
                 STAGE_LATCH_MEM: begin
-                    video_data_r <= video_data_i;
+                    if (line_type_w == VIDEX_LINE)
+                        videx_data_r <= videx_vram_data_i;
+                    else
+                        video_data_r <= video_data_i;
                     pix_delay_r <= 1'b0;
                     pix_buffer_r[28] <= 1'b0;
                 end
@@ -483,6 +612,37 @@ module apple_video (
                 end
                 STAGE_TEXT80_5: begin
                     pix_buffer_r[20:14] <= viderom_d_r[6:0];
+                end
+                // Videx 80-col pipeline: 4 chars × 7 pixels = 28 pixels per cycle
+                // Stage 0: Issue ROM lookup for char 0
+                STAGE_VIDEX_0: begin
+                    videxrom_a_r <= {videx_data_r[7:0], videx_scanline_w};
+                end
+                // Stage 1: Issue ROM lookup for char 1
+                STAGE_VIDEX_1: begin
+                    videxrom_a_r <= {videx_data_r[15:8], videx_scanline_w};
+                end
+                // Stage 2: Capture char 0 pixels, issue ROM lookup for char 2
+                STAGE_VIDEX_2: begin
+                    pix_buffer_r[6:0] <= (videx_cursor_active_w && videx_cursor_byte_w == 2'd0) ?
+                        videxrom_d_r[6:0] ^ 7'h7F : videxrom_d_r[6:0];
+                    videxrom_a_r <= {videx_data_r[23:16], videx_scanline_w};
+                end
+                // Stage 3: Capture char 1 pixels, issue ROM lookup for char 3
+                STAGE_VIDEX_3: begin
+                    pix_buffer_r[13:7] <= (videx_cursor_active_w && videx_cursor_byte_w == 2'd1) ?
+                        videxrom_d_r[6:0] ^ 7'h7F : videxrom_d_r[6:0];
+                    videxrom_a_r <= {videx_data_r[31:24], videx_scanline_w};
+                end
+                // Stage 4: Capture char 2 pixels
+                STAGE_VIDEX_4: begin
+                    pix_buffer_r[20:14] <= (videx_cursor_active_w && videx_cursor_byte_w == 2'd2) ?
+                        videxrom_d_r[6:0] ^ 7'h7F : videxrom_d_r[6:0];
+                end
+                // Stage 5: Capture char 3 pixels
+                STAGE_VIDEX_5: begin
+                    pix_buffer_r[27:21] <= (videx_cursor_active_w && videx_cursor_byte_w == 2'd3) ?
+                        videxrom_d_r[6:0] ^ 7'h7F : videxrom_d_r[6:0];
                 end
                 // prepare for next cycle
                 STAGE_LOAD_SHIFT: begin
