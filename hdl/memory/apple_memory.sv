@@ -219,9 +219,13 @@ module apple_memory #(
             assign a2mem_if.VIDEX_CRTC_R14 = videx_crtc_regs[14];
             assign a2mem_if.VIDEX_CRTC_R15 = videx_crtc_regs[15];
 
-            // Videx VRAM write capture
-            wire videx_vram_write_enable = write_strobe &&
-                                           (SLOTROM == 3'd3) &&
+            // Videx VRAM write capture — use phi1_posedge timing (matching CRTC
+            // capture) rather than data_in_strobe; data_in_strobe is gated by
+            // m2sel_n which may suppress it for I/O-space ($C000-$CFFF) writes.
+            wire videx_vram_write_enable = a2bus_if.phi1_posedge &&
+                                           !a2bus_if.rw_n &&
+                                           !a2bus_if.m2sel_n &&
+                                           videx_mode_r &&
                                            (a2bus_if.addr[15:9] == 7'b1100_110);  // $CC00-$CDFF
 
             // Full VRAM address = bank offset + (bus_addr & 0x1FF)
