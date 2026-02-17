@@ -142,6 +142,25 @@ module apple_video #(
             shrg_mode_r                 <= video_control_if.shrg_mode(a2mem_if.SHRG_MODE);
 
             videx_mode_r                <= VIDEX_SUPPORT ? a2mem_if.VIDEX_MODE : 1'b0;
+
+            // Videx CRTC registers — latched during blanking alongside the
+            // other video state above, using if/else on the parameter to
+            // match the pattern used for videx_mode_r.
+            if (VIDEX_SUPPORT) begin
+                videx_r10_r <= a2mem_if.VIDEX_CRTC_R10;
+                videx_r11_r <= a2mem_if.VIDEX_CRTC_R11;
+                videx_r12_r <= a2mem_if.VIDEX_CRTC_R12;
+                videx_r13_r <= a2mem_if.VIDEX_CRTC_R13;
+                videx_r14_r <= a2mem_if.VIDEX_CRTC_R14;
+                videx_r15_r <= a2mem_if.VIDEX_CRTC_R15;
+            end else begin
+                videx_r10_r <= 8'h0;
+                videx_r11_r <= 8'h0;
+                videx_r12_r <= 8'h0;
+                videx_r13_r <= 8'h0;
+                videx_r14_r <= 8'h0;
+                videx_r15_r <= 8'h0;
+            end
         end
     end
 
@@ -149,28 +168,6 @@ module apple_video #(
     reg videx_mode_r;
     reg [7:0] videx_r10_r, videx_r11_r;
     reg [7:0] videx_r12_r, videx_r13_r, videx_r14_r, videx_r15_r;
-
-    generate if (VIDEX_SUPPORT) begin : videx_regs_gen
-        always @(posedge a2bus_if.clk_pixel) begin
-            if (blanking_active_w) begin
-                videx_r10_r <= a2mem_if.VIDEX_CRTC_R10;
-                videx_r11_r <= a2mem_if.VIDEX_CRTC_R11;
-                videx_r12_r <= a2mem_if.VIDEX_CRTC_R12;
-                videx_r13_r <= a2mem_if.VIDEX_CRTC_R13;
-                videx_r14_r <= a2mem_if.VIDEX_CRTC_R14;
-                videx_r15_r <= a2mem_if.VIDEX_CRTC_R15;
-            end
-        end
-    end else begin : no_videx_regs_gen
-        always @(posedge a2bus_if.clk_pixel) begin
-            videx_r10_r <= 8'h0;
-            videx_r11_r <= 8'h0;
-            videx_r12_r <= 8'h0;
-            videx_r13_r <= 8'h0;
-            videx_r14_r <= 8'h0;
-            videx_r15_r <= 8'h0;
-        end
-    end endgenerate
 
     // Videx geometry: 9 scanlines per row × 24 rows = 216 content lines × 2 (doubling) = 432 pixels.
     wire [10:0] videx_text_base_w = {videx_r12_r[2:0], videx_r13_r};
