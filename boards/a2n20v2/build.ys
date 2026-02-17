@@ -1,0 +1,108 @@
+# Yosys synthesis script for A2N20v2 (Gowin GW2AR-18C)
+# Hybrid: GHDL for VHDL, read_verilog for PLL, slang for SystemVerilog
+# Order: Gowin cells -> PLL -> slang (with stubs) -> GHDL (overwrites stubs)
+
+# ===== STEP 1: Load Gowin cell library =====
+read_verilog -specify -lib +/gowin/cells_sim.v
+read_verilog -specify -lib +/gowin/cells_xtra_gw2a.v
+
+# ===== STEP 2: Load PLL files with read_verilog (defparam style) =====
+read_verilog -sv \
+    /tmp/a2n20v2_build/board_hdl/gowin/clk_logic/clk_logic.v \
+    /tmp/a2n20v2_build/board_hdl/gowin/clk_hdmi/clk_hdmi.v
+
+# ===== STEP 3: Load SystemVerilog files via slang =====
+# Stubs for VHDL modules provide port definitions for slang type checking.
+# GHDL step below will overwrite these with real implementations.
+read_slang \
+    --compat-mode \
+    --ignore-timing \
+    --ignore-assertions \
+    --no-synthesis-define \
+    --extern-modules \
+    --blackboxed-module f18a_core \
+    --blackboxed-module via6522 \
+    --blackboxed-module ssc_rom \
+    --blackboxed-module clk_logic \
+    --blackboxed-module clk_hdmi \
+    -I/tmp/a2n20v2_build/board_hdl \
+    -I/tmp/a2n20v2_build/hdl \
+    /tmp/a2n20v2_build/stubs/f18a_core.sv \
+    /tmp/a2n20v2_build/stubs/via6522.sv \
+    /tmp/a2n20v2_build/stubs/ssc_rom.sv \
+    /tmp/a2n20v2_build/hdl/bus/a2bus_if.sv \
+    /tmp/a2n20v2_build/hdl/debug/debugoverlay.sv \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_gpu_if.sv \
+    /tmp/a2n20v2_build/hdl/f18a/f18a.sv \
+    /tmp/a2n20v2_build/hdl/hdmi/audio_clock_regeneration_packet.sv \
+    /tmp/a2n20v2_build/hdl/hdmi/audio_info_frame.sv \
+    /tmp/a2n20v2_build/hdl/hdmi/audio_sample_packet.sv \
+    /tmp/a2n20v2_build/hdl/hdmi/auxiliary_video_information_info_frame.sv \
+    /tmp/a2n20v2_build/hdl/hdmi/hdmi.sv \
+    /tmp/a2n20v2_build/hdl/hdmi/packet_assembler.sv \
+    /tmp/a2n20v2_build/hdl/hdmi/packet_picker.sv \
+    /tmp/a2n20v2_build/hdl/hdmi/serializer.sv \
+    /tmp/a2n20v2_build/hdl/hdmi/source_product_description_info_frame.sv \
+    /tmp/a2n20v2_build/hdl/hdmi/tmds_channel.sv \
+    /tmp/a2n20v2_build/hdl/memory/a2mem_if.sv \
+    /tmp/a2n20v2_build/hdl/memory/apple_memory.sv \
+    /tmp/a2n20v2_build/hdl/mockingboard/mockingboard.sv \
+    /tmp/a2n20v2_build/hdl/slots/slot_if.sv \
+    /tmp/a2n20v2_build/hdl/slots/slotmaker.sv \
+    /tmp/a2n20v2_build/hdl/slots/slotmaker_config_if.sv \
+    /tmp/a2n20v2_build/hdl/sound/apple_speaker.sv \
+    /tmp/a2n20v2_build/hdl/ssc/super_serial_card.sv \
+    /tmp/a2n20v2_build/hdl/supersprite/supersprite.sv \
+    /tmp/a2n20v2_build/hdl/support/cdc_denoise.sv \
+    /tmp/a2n20v2_build/hdl/support/cdc_sampling.sv \
+    /tmp/a2n20v2_build/hdl/support/debounce.sv \
+    /tmp/a2n20v2_build/hdl/support/sdpram32.sv \
+    /tmp/a2n20v2_build/hdl/support/YM2149.sv \
+    /tmp/a2n20v2_build/hdl/video/apple_video.sv \
+    /tmp/a2n20v2_build/hdl/video/vgc.sv \
+    /tmp/a2n20v2_build/hdl/video/video_control_if.sv \
+    /tmp/a2n20v2_build/hdl/sound/audio_out.v \
+    /tmp/a2n20v2_build/hdl/support/iir_filter.v \
+    /tmp/a2n20v2_build/hdl/support/uart_6551.v \
+    /tmp/a2n20v2_build/hdl/support/uart_rx.v \
+    /tmp/a2n20v2_build/hdl/support/uart_tx.v \
+    /tmp/a2n20v2_build/board_hdl/bus/apple_bus.sv \
+    /tmp/a2n20v2_build/board_hdl/top.sv
+
+# ===== STEP 4: Delete blackbox stubs before GHDL elaboration =====
+select =f18a_core
+delete
+select =via6522
+delete
+select =ssc_rom
+delete
+select *
+
+# ===== STEP 4b: Load and elaborate VHDL via GHDL =====
+# Use -fexplicit to resolve synopsys operator ambiguity
+# Use files... -e unit syntax to analyze and elaborate in one step
+ghdl --std=93 --ieee=synopsys -fexplicit --latches \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_version.vhd \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_color.vhd \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_counters.vhd \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_div32x16.vhd \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_single_port_ram.vhd \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_tile_linebuf.vhd \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_sprites.vhd \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_tiles.vhd \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_cpu.vhd \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_vga_cont_640_60.vhd \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_vram.vhd \
+    /tmp/a2n20v2_build/hdl/f18a/f18a_core.vhd \
+    -e f18a_core
+
+ghdl --std=93 --ieee=synopsys -fexplicit --latches \
+    /tmp/a2n20v2_build/hdl/support/via6522.vhd \
+    -e via6522
+
+ghdl --std=93 --ieee=synopsys -fexplicit --latches \
+    /tmp/a2n20v2_build/hdl/ssc/ssc_rom.vhd \
+    -e ssc_rom
+
+# ===== STEP 5: Synthesize for Gowin GW2A family =====
+synth_gowin -top top -family gw2a -json a2n20v2.json

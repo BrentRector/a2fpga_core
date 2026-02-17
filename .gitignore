@@ -36,4 +36,9 @@ src/picosoc/firmware/firmware.hex
 src/cardrom/cardrom_Output.txt
 src/cardrom/_FileInformation.txt
 src/cardrom/cardrom
+# OSS toolchain build intermediates
+*_pnr.json
+boards/*/a2n20v2.json
+boards/*/a2n20v2.fs
+
 /.claude
