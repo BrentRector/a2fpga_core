@@ -219,13 +219,14 @@ module apple_memory #(
             assign a2mem_if.VIDEX_CRTC_R14 = videx_crtc_regs[14];
             assign a2mem_if.VIDEX_CRTC_R15 = videx_crtc_regs[15];
 
-            // Videx VRAM write capture — use phi1_posedge timing (matching CRTC
-            // capture) rather than data_in_strobe; data_in_strobe is gated by
-            // m2sel_n which may suppress it for I/O-space ($C000-$CFFF) writes.
-            wire videx_vram_write_enable = a2bus_if.phi1_posedge &&
-                                           !a2bus_if.rw_n &&
-                                           !a2bus_if.m2sel_n &&
-                                           videx_mode_r &&
+            // Videx VRAM write capture — inline write_strobe expression here
+            // rather than referencing the module-level wire, because Gowin
+            // synthesis does not resolve module-level wires inside generate
+            // blocks (same scoping issue fixed for write_word in commit 0af9da6).
+            // Access SLOTROM via a2mem_if interface for the same reason.
+            wire videx_vram_write_enable = !a2bus_if.rw_n &&
+                                           a2bus_if.data_in_strobe &&
+                                           (a2mem_if.SLOTROM == 3'd3) &&
                                            (a2bus_if.addr[15:9] == 7'b1100_110);  // $CC00-$CDFF
 
             // Full VRAM address = bank offset + (bus_addr & 0x1FF)
