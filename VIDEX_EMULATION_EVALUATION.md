@@ -265,76 +265,251 @@ Everything else already exists in the shadow implementation.
 
 ---
 
-## 6. Head-to-Head Comparison
+## 6. Approach C: Custom Firmware ROM with IIe 80-Col Backend
 
-### 6.1 Space
+### 6.1 Concept
 
-| | Approach A (TEXT80) | Approach B (VIDEX_LINE) |
-|--|---------------------|------------------------|
-| Firmware ROM | 2 KB BSRAM | 2 KB BSRAM |
-| CRTC registers | 128 FFs | 128 FFs |
-| Card VRAM | 2 KB BSRAM | (reuses existing shadow VRAM) |
-| Char translation LUT | 256 bytes | **Not needed** |
-| Row base address LUT | 240 bits | **Not needed** |
-| Sync state machine | ~200 FFs + ~300 LUTs | **Not needed** |
-| Write port mux | ~50 LUTs | **Not needed** |
-| Div-by-80 multiplier | 1 multiplier | **Not needed** |
-| VRAM read-back | (text_vram already readable) | ~30 LUTs |
-| Videx char ROM (4 KB) | Still synthesized (VIDEX_SUPPORT=1) | Already present |
-| VIDEX_LINE stages | Still synthesized (VIDEX_SUPPORT=1) | Already present |
-| **Net additional logic** | **~550 LUTs + 1 mult** | **~30 LUTs** |
+Instead of emulating Videx hardware (CRTC + VRAM), write a **custom 6502 firmware ROM** that presents the same Videx-compatible software interface (signature bytes, entry points, COUT redirection) but internally redirects all character output to the IIe 80-column text pages. The existing `TEXT80_LINE` rendering pipeline displays the result. No CRTC emulation, no Videx VRAM, no Videx character ROM needed.
 
-**Winner: Approach B.** Approach A adds translation logic but does NOT eliminate the Videx rendering path (it's still in the bitstream). Approach B reuses what's already there with minimal additions.
+This is analogous to writing a device driver shim: the API stays the same, but the underlying implementation is completely different.
 
-If `VIDEX_SUPPORT=0` (Videx path stripped), Approach A avoids ~4 KB BSRAM (Videx char ROM + VRAM) but adds ~550 LUTs + 1 multiplier + its own 2 KB VRAM. This is not a meaningful savings — and loses visual fidelity.
+### 6.2 Architecture
 
-### 6.2 Performance
+```
+Custom ROM (6502 code)     apple_memory           apple_video
+┌──────────────────┐      ┌──────────────┐       ┌──────────────┐
+│ Videx-compatible │      │              │       │              │
+│ entry points &   │      │  text_vram   │──────>│  TEXT80_LINE  │───> HDMI
+│ signature bytes  │      │  (main+aux)  │       │  pipeline    │
+│                  │ CPU  │              │       │              │
+│ COUT handler:    │writes│              │       │              │
+│  toggle RAMWRT   │─────>│  shadow      │       │              │
+│  write to $0400+ │      │  captures    │       │              │
+│  set COL80       │      │              │       │              │
+└──────────────────┘      └──────────────┘       └──────────────┘
+```
 
-| | Approach A (TEXT80) | Approach B (VIDEX_LINE) |
-|--|---------------------|------------------------|
-| Character write latency | Up to 36 µs (sync engine cycle) | **0 cycles** (direct VRAM write → immediate render) |
-| Scroll latency | Up to 36 µs | **0 cycles** (R12/R13 change takes effect next frame) |
-| Write port contention | Arbitration needed (bus vs sync) | **None** (separate VRAM, no contention) |
-| Rendering accuracy | 8-scanline approximation | **Exact 9-scanline rendering** |
+### 6.3 How It Would Work
 
-**Winner: Approach B.** Zero translation latency, zero scroll latency, zero contention.
+**Initialization (PR#3 entry at $C300):**
+1. Custom firmware ROM serves Videx-compatible signature bytes (so card detection works)
+2. ROM code patches CSW ($36/$37) to redirect COUT to the card's expansion ROM
+3. ROM writes `STA $C00D` to set COL80 — this activates `TEXT80_LINE` rendering on the A2FPGA
+4. ROM clears both main and aux text pages (writing spaces to all positions)
 
-### 6.3 Maintenance
+**Character output (COUT handler in $C800 expansion ROM):**
+For each character to display in 80-column mode, the firmware must write to the IIe-style interleaved text page:
 
-| | Approach A (TEXT80) | Approach B (VIDEX_LINE) |
-|--|---------------------|------------------------|
-| Conceptual complexity | High — bridges two different display models | Low — single Videx-native model |
-| Cross-module coupling | Card → sync engine → text_vram → TEXT80 pipeline | Card → a2mem_if → VIDEX_LINE pipeline |
-| Bug surface area | Address translation, char translation, sync timing, write arbitration | VRAM read-back mux |
-| Impact of TEXT80 changes | Could break Videx emulation | **No impact** (independent path) |
-| Impact of VIDEX_LINE changes | No impact | Could affect emulation (but same team maintains both) |
-| Code to write | ~400 lines (card) + ~300 lines (translation) | ~400 lines (card) + ~30 lines (read-back) |
-| Code to debug | Translation correctness for 1920 positions × 256 chars | Standard bus response logic |
+```
+1. Calculate IIe scrambled address from linear cursor position:
+   - row = cursor_pos / 80
+   - col = cursor_pos % 80
+   - base = $0400 + row_base_table[row]  (Apple II scrambled row addressing)
+   - byte_offset = col / 2
+   - addr = base + byte_offset
 
-**Winner: Approach B.** Self-contained, minimal coupling, dramatically less new code.
+2. Translate Videx character encoding to IIe encoding:
+   - Videx $00-$7F (normal) → IIe $80-$FF (normal range)
+   - Videx $80-$FF (inverse) → IIe $00-$3F (inverse)
 
-### 6.4 Summary Table
+3. If col is even (main page column):
+   - Clear RAMWRT: STA $C004
+   - Write character to addr
+4. If col is odd (aux page column):
+   - Set RAMWRT: STA $C005
+   - Write character to addr
+   - Clear RAMWRT: STA $C004  (restore normal state)
 
-| Criterion | Approach A (TEXT80) | Approach B (VIDEX_LINE) |
-|-----------|:-------------------:|:-----------------------:|
-| Additional LUTs | ~550 | ~30 |
-| Additional BSRAM | 0 (but doesn't eliminate Videx BSRAM) | 0 |
-| Write latency | Up to 36 µs | 0 |
-| Scroll latency | Up to 36 µs | 0 |
-| Character fidelity | 8-scanline, IIe font, 64 inverse glyphs | 9-scanline, Videx font, 128 inverse glyphs |
-| New code | ~700 lines | ~430 lines |
-| Bug surface area | Large (4 translation subsystems) | Small (bus response only) |
-| Cross-module coupling | High | Low |
+5. Advance cursor position
+```
+
+**Scrolling:**
+No hardware scroll available (no CRTC R12/R13). Must software-scroll by copying all 1920 characters up one row, toggling RAMWRT for each aux page access. Approximately 3840 byte copies + 1920 RAMWRT toggles per scroll — roughly 30,000+ cycles per scroll operation.
+
+### 6.4 Technical Constraints
+
+**A. Aux memory writes work on ][+:** Confirmed. The A2FPGA's shadow text_vram capture in `apple_memory.sv` routes writes through RAMWRT (`apple_memory.sv:270-271`). Setting RAMWRT on a ][+ (writing to $C005) causes subsequent text page writes to go to the aux slot in the shadow BSRAM, even though no physical aux RAM exists. This is sufficient for the `TEXT80_LINE` renderer.
+
+**B. Aux memory reads do NOT work on ][+:** The RAMRD soft switch can be set, but the A2FPGA does NOT drive data onto the ][+ bus for main memory reads. The CPU always reads from the ][+ motherboard's main RAM. The custom ROM **cannot read back what it wrote to the aux text page**.
+
+This has major consequences:
+- Scrolling requires reading existing screen contents to copy them up. The aux columns cannot be read.
+- The ROM must maintain its own copy of all aux-column characters (960 bytes of internal bookkeeping)
+- Or the ROM must track all screen state internally (cursor position, character buffer), never reading the screen
+
+**C. COL80 can be set on ][+:** Writing to $C00D triggers the COL80 soft switch in `apple_memory.sv:92-93`. No hardware guards prevent this on a ][+. Confirmed working.
+
+**D. CRTC probe detection problem:** Software that detects a Videx by writing a test value to CRTC R14 and reading it back expects the card hardware to respond. Options:
+- The card hardware still handles $C0B0/$C0B1 with a minimal CRTC register file (just enough for detection) — but this partially defeats the "no CRTC emulation" advantage
+- Accept that CRTC-probing software won't find the card — but this breaks some detection methods
+- The custom ROM could provide a detection API that doesn't depend on CRTC read-back — but existing software won't use it
+
+**E. Direct VRAM access is broken:** Software that writes directly to $CC00-$CDFF (bypassing COUT) will write to addresses that aren't connected to anything. This affects Apple Writer II, WordStar, and other programs that directly manipulate Videx VRAM.
+
+### 6.5 Visual Fidelity
+
+| Aspect | Result |
+|--------|--------|
+| Character display | Works — IIe encoding, IIe font |
+| 80-column text | Works — via TEXT80_LINE |
+| Character font | **IIe font, not Videx font** — different glyph designs |
+| Scanline geometry | **8-scanline (IIe), not 9-scanline (Videx)** — shorter descenders |
+| Active area | **384 px tall, not 432 px** — smaller text region |
+| Inverse characters | **Partial** — IIe has only 64 inverse chars (no inverse lowercase) |
+| Hardware scrolling | **None** — must software-scroll (slow, visible tearing) |
+| Cursor | IIe-style cursor (different from Videx MC6845 cursor blink modes) |
+| Multiple character sets | **None** — uses built-in IIe character ROM |
+
+### 6.6 Software Compatibility
+
+| Software Category | Works? | Why |
+|-------------------|--------|-----|
+| Programs using COUT ($FDED) | Yes | Custom ROM intercepts via CSW |
+| Programs detecting Videx via ROM signatures ($C305) | Yes | Custom ROM has correct bytes |
+| Programs detecting Videx via CRTC R14/R15 probe | **Partial** | Needs minimal CRTC stub or fails |
+| Programs writing directly to VRAM ($CC00-$CDFF) | **No** | VRAM doesn't exist in this approach |
+| Programs reading VRAM | **No** | No VRAM to read |
+| Programs using hardware scroll (R12/R13) | **No** | No CRTC; firmware software-scrolls |
+| Programs setting cursor via R14/R15 | **Partial** | ROM tracks cursor internally; hardware won't respond |
+
+### 6.7 Development Effort
+
+The custom ROM is substantial 6502 development:
+- Terminal driver: COUT handler, control code processing, cursor management (~512 bytes)
+- Address translation: IIe scrambled addressing with div/mod 80 (~128 bytes)
+- Character encoding translation (~128 bytes)
+- RAMWRT toggle logic for every aux column write (~64 bytes)
+- Scroll routine with internal screen buffer (~256 bytes + 960 bytes RAM for aux mirror)
+- Detection-compatible header with signature bytes (~16 bytes)
+- Total: ~1-1.5 KB of carefully optimized 6502 assembly
+
+This is new code that must be written, debugged, and maintained. By contrast, Approaches A and B use the actual Videx ROM (known-working firmware).
+
+### 6.8 Resource Cost
+
+| Component | Cost |
+|-----------|------|
+| Firmware ROM | 2 KB BSRAM (1 block) |
+| CRTC stub for detection (if included) | ~50 LUTs + 128 FFs |
+| No Videx VRAM | Saves 2 KB BSRAM vs Approach B |
+| No Videx character ROM | Saves 4 KB SSRAM vs Approach B |
+| **Net FPGA cost** | **1 BSRAM block + ~50 LUTs** |
+
+This is the lowest FPGA resource cost of any approach. But it shifts complexity from hardware to firmware (6502 software development).
+
+### 6.9 Assessment
+
+Approach C trades FPGA resource savings for significant compromises:
+
+**Advantages over A and B:**
+- Lowest FPGA resource usage (1 BSRAM block, ~50 LUTs)
+- No CRTC emulation needed (or only a minimal stub)
+- No Videx VRAM needed
+- No Videx character ROM needed
+
+**Disadvantages:**
+- Requires writing and maintaining a custom 6502 terminal driver from scratch
+- Direct VRAM access is broken (Apple Writer II, WordStar, other power-user software)
+- No hardware scrolling (software scroll is slow with visible tearing)
+- Aux page read-back impossible on ][+ — ROM must maintain internal screen buffer
+- Visual fidelity is IIe-level (8 scanlines, IIe font, partial inverse) not Videx-level
+- RAMWRT toggling for every odd-column character adds overhead to every character output
+- Any feature of the Videx not explicitly reimplemented in the custom ROM is lost
+
+The fundamental tension: this approach avoids emulating the Videx hardware by reimplementing the Videx *software* from scratch — and the software reimplementation is incomplete (no direct VRAM, no hardware scroll, no aux reads). The programs most likely to use a Videx card (word processors, terminal programs) are exactly the ones that use direct VRAM access.
 
 ---
 
-## 7. Recommendation
+## 7. Head-to-Head Comparison (All Three Approaches)
+
+### 7.1 Space
+
+| | Approach A (TEXT80) | Approach B (VIDEX_LINE) | Approach C (Custom ROM) |
+|--|---------------------|------------------------|------------------------|
+| Firmware ROM | 2 KB BSRAM (Videx ROM) | 2 KB BSRAM (Videx ROM) | 2 KB BSRAM (**custom ROM**) |
+| CRTC registers | 128 FFs | 128 FFs | ~50 LUTs (stub for detection) |
+| Card VRAM | 2 KB BSRAM | 2 KB BSRAM (for read-back) | **Not needed** |
+| Char translation LUT | 256 bytes | **Not needed** | **Not needed** (in 6502 code) |
+| Row base address LUT | 240 bits | **Not needed** | **Not needed** (in 6502 code) |
+| Sync state machine | ~200 FFs + ~300 LUTs | **Not needed** | **Not needed** |
+| Write port mux | ~50 LUTs | **Not needed** | **Not needed** |
+| Div-by-80 multiplier | 1 multiplier | **Not needed** | **Not needed** |
+| VRAM read-back | (text_vram already readable) | ~30 LUTs | **Not needed** |
+| Videx char ROM (4 KB) | Still synthesized (VIDEX_SUPPORT=1) | Already present | **Not needed** |
+| VIDEX_LINE stages | Still synthesized (VIDEX_SUPPORT=1) | Already present | **Not needed** |
+| BSRAM blocks used | 2 | 2 | **1** |
+| **Net additional logic** | **~550 LUTs + 1 mult** | **~30 LUTs** | **~50 LUTs** |
+
+**Winner: Approach B** on balance. Approach C uses the fewest resources but shifts all complexity into 6502 firmware and loses compatibility. Approach A adds translation logic without eliminating the Videx rendering path. Approach B reuses what's already there with minimal additions.
+
+### 7.2 Performance
+
+| | Approach A (TEXT80) | Approach B (VIDEX_LINE) | Approach C (Custom ROM) |
+|--|---------------------|------------------------|------------------------|
+| Character write latency | Up to 36 µs (sync engine cycle) | **0 cycles** (direct VRAM write → immediate render) | ~50 cycles (RAMWRT toggle + write) |
+| Scroll latency | Up to 36 µs | **0 cycles** (R12/R13 change takes effect next frame) | **~30,000 cycles** (software copy of 1920 chars with RAMWRT toggles) |
+| Write port contention | Arbitration needed (bus vs sync) | **None** (separate VRAM, no contention) | **None** (CPU writes directly) |
+| Rendering accuracy | 8-scanline approximation | **Exact 9-scanline rendering** | 8-scanline (IIe pipeline) |
+
+**Winner: Approach B.** Zero translation latency, zero scroll latency, zero contention. Approach C's software scrolling is orders of magnitude slower than B's hardware scrolling.
+
+### 7.3 Compatibility
+
+| | Approach A (TEXT80) | Approach B (VIDEX_LINE) | Approach C (Custom ROM) |
+|--|---------------------|------------------------|------------------------|
+| PR#3 activation | Works (Videx ROM) | Works (Videx ROM) | Works (custom ROM) |
+| ROM signature detection | Works (Videx ROM) | Works (Videx ROM) | Works (compatible bytes) |
+| CRTC R14/R15 probe | Works (card emulates) | Works (card emulates) | **Partial** (stub or broken) |
+| COUT-based output | Works | Works | Works |
+| Direct VRAM writes ($CC00) | Works (card captures) | Works (card captures) | **Broken** (no VRAM) |
+| Direct VRAM reads ($CC00) | Works (card responds) | Works (card responds) | **Broken** (no VRAM) |
+| Hardware scroll (R12/R13) | Works (translated) | Works (native) | **Broken** (software only) |
+| Cursor via R14/R15 | Works | Works | **Partial** (ROM tracks internally) |
+| Multiple character sets | Via IIe font (limited) | Via Videx char ROM | **None** (IIe font only) |
+
+**Winner: Approach B.** Full compatibility. Approach A is close but has character encoding limitations. Approach C breaks direct VRAM access, which affects the most important Videx software.
+
+### 7.4 Maintenance
+
+| | Approach A (TEXT80) | Approach B (VIDEX_LINE) | Approach C (Custom ROM) |
+|--|---------------------|------------------------|------------------------|
+| Conceptual complexity | High — bridges two display models | Low — single Videx-native model | High — reimplements Videx software |
+| Cross-module coupling | Card → sync → text_vram → TEXT80 | Card → a2mem_if → VIDEX_LINE | Card → RAMWRT → text_vram → TEXT80 |
+| Bug surface area | Address/char translation, sync timing, write arbitration | VRAM read-back mux | 6502 terminal driver, address translation, RAMWRT management, aux page bookkeeping |
+| Code to write (HDL) | ~400 + ~300 lines | ~400 + ~30 lines | ~50 lines (CRTC stub) |
+| Code to write (6502 ASM) | 0 (uses Videx ROM) | 0 (uses Videx ROM) | **~1-1.5 KB of new 6502 assembly** |
+| Firmware copyright | Videx ROM (copyrighted) | Videx ROM (copyrighted) | Original code (no copyright issue) |
+
+**Winner: Approach B.** Self-contained, minimal coupling, dramatically less new code.
+
+### 7.5 Summary Table
+
+| Criterion | Approach A (TEXT80) | Approach B (VIDEX_LINE) | Approach C (Custom ROM) |
+|-----------|:-------------------:|:-----------------------:|:----------------------:|
+| Additional LUTs | ~550 | ~30 | ~50 |
+| Additional BSRAM blocks | 2 | 2 | 1 |
+| Write latency | Up to 36 µs | 0 | ~50 cycles |
+| Scroll latency | Up to 36 µs | 0 | **~30,000 cycles** |
+| Character fidelity | 8-scanline, IIe font, 64 inverse | **9-scanline, Videx font, 128 inverse** | 8-scanline, IIe font, 64 inverse |
+| Direct VRAM access | Works | Works | **Broken** |
+| Hardware scrolling | Works (translated) | **Native** | **None** |
+| New HDL code | ~700 lines | ~430 lines | ~50 lines |
+| New 6502 code | 0 (Videx ROM) | 0 (Videx ROM) | **~1-1.5 KB** |
+| Copyright concern | Videx ROM | Videx ROM | **None (original code)** |
+| Bug surface area | Large (4 translation subsystems) | Small (bus response only) | Large (6502 terminal driver) |
+| Cross-module coupling | High | Low | Medium |
+
+---
+
+## 8. Recommendation
 
 **Build upon the existing Videx shadow implementation (Approach B).**
 
-The `VIDEX_LINE` rendering path already solves the hard problems — 9-scanline geometry, hardware scrolling, cursor blinking, linear VRAM addressing, and Videx character ROM lookup. It was designed to faithfully reproduce Videx video output and it does so. The only thing missing is an active card module to drive the bus side.
+The `VIDEX_LINE` rendering path already solves the hard problems — 9-scanline geometry, hardware scrolling, cursor blinking, linear VRAM addressing, and Videx character ROM lookup. It was designed to faithfully reproduce Videx video output and it does so. The only thing missing is an active card module to drive the bus side — specifically, the read-back paths (CRTC R14/R15 and VRAM) and ROM serving that the passive shadow doesn't provide.
 
 Approach A (TEXT80 mapping) adds significant complexity to bridge two fundamentally different display models — scrambled vs. linear addressing, different character encodings, different scanline counts, different character ROMs — and the result is still a visual approximation. Meanwhile, the rendering infrastructure it tries to reuse (TEXT80) is dead code on a ][/][+ anyway, while the infrastructure it tries to avoid (VIDEX_LINE) is already synthesized and working.
+
+Approach C (Custom ROM) is the most resource-efficient but has the most severe compatibility gaps. It avoids emulating Videx hardware by reimplementing the Videx *software* — but that reimplementation cannot intercept direct VRAM access, cannot provide hardware scrolling, and requires the ][+ to toggle RAMWRT for every odd-column character write. The programs most likely to use a Videx (word processors, terminal programs) are exactly the ones that use direct VRAM access. Its one unique advantage is the absence of Videx ROM copyright concerns, since the firmware would be original code.
 
 The Videx shadow path was built to render Videx output faithfully. Promoting it from "passive shadow" to "active emulation" is the natural evolution.
 
