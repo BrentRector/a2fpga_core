@@ -397,26 +397,47 @@ This is new code that must be written, debugged, and maintained. By contrast, Ap
 
 This is the lowest FPGA resource cost of any approach. But it shifts complexity from hardware to firmware (6502 software development).
 
-### 6.9 Assessment
+### 6.9 How Apple ][+ Software Actually Used the Videx
 
-Approach C trades FPGA resource savings for significant compromises:
+Research into the Videx software ecosystem shows this approach has a fundamental compatibility problem.
 
-**Advantages over A and B:**
-- Lowest FPGA resource usage (1 BSRAM block, ~50 LUTs)
-- No CRTC emulation needed (or only a minimal stub)
-- No Videx VRAM needed
-- No Videx character ROM needed
+The Videx firmware ROM provided a terminal-like API via COUT redirection (CSW): control codes for clear screen, cursor positioning (CHR$(30) GOTOXY), line feed, carriage return, clear-to-EOL, normal/inverse mode, and a limited "pick" function (CTRL-U) that could read one character at the cursor position. This API was adequate for sequential text output (BASIC programs, simple utilities, Apple Pascal).
 
-**Disadvantages:**
-- Requires writing and maintaining a custom 6502 terminal driver from scratch
-- Direct VRAM access is broken (Apple Writer II, WordStar, other power-user software)
-- No hardware scrolling (software scroll is slow with visible tearing)
-- Aux page read-back impossible on ][+ — ROM must maintain internal screen buffer
-- Visual fidelity is IIe-level (8 scanlines, IIe font, partial inverse) not Videx-level
-- RAMWRT toggling for every odd-column character adds overhead to every character output
-- Any feature of the Videx not explicitly reimplemented in the custom ROM is lost
+However, the firmware API critically lacked:
+- **General screen reading** — only CTRL-U at cursor position, no read-at-coordinate
+- **Random-access writes without cursor disruption** — GOTOXY+print required multiple control bytes per character vs. a single STA to VRAM
+- **Partial screen scrolling / scroll regions** — not supported
+- **Insert/delete line operations** — not supported
+- **Any text attributes beyond normal/inverse** — not supported
 
-The fundamental tension: this approach avoids emulating the Videx hardware by reimplementing the Videx *software* from scratch — and the software reimplementation is incomplete (no direct VRAM, no hardware scroll, no aux reads). The programs most likely to use a Videx card (word processors, terminal programs) are exactly the ones that use direct VRAM access.
+As the GlassTTY programming guide stated: "The Videoterm card has a couple of methods of displaying characters on the screen. **Typically, both approaches will be needed.**"
+
+**Roughly 60-70% of commercially important Videx software accessed VRAM and/or CRTC registers directly**, either exclusively or in combination with COUT:
+
+| Software | Access Method | Why Direct Access Was Required |
+|----------|-------------|-------------------------------|
+| Apple Writer II | Direct VRAM (shipped with Videx pre-boot disk) | Random-access screen updates, reading screen contents, fast scrolling |
+| VisiCalc VC/80 | Direct VRAM | Cell-by-cell screen updates across arbitrary positions |
+| WordStar (CP/M) | CP/M BIOS with direct screen positioning | Real-time cursor positioning, block highlighting, formatting codes |
+| ASCII Express | Card-specific video driver | Split-screen, status lines, screen capture |
+| DB Master | Likely direct VRAM | Data entry forms with field-level updates |
+| Terminal programs | Direct VRAM for status/split | Multi-window terminal operation |
+
+**Only ~30-40% of Videx software used COUT exclusively** — primarily Applesoft BASIC programs, Apple Pascal programs, simple utilities, and educational software.
+
+The phrase "Videx compatible" in the ][+ era specifically meant **hardware-level compatibility**: same VRAM bank-switching at $C0Bx, same 512-byte window at $CC00-$CDFF, same linear screen layout, same CRTC register interface. Cards that weren't hardware-compatible (like the Digitek Screenmaster 80, which used continuous rather than banked memory) broke most serious software despite having working COUT.
+
+### 6.10 Assessment
+
+**Approach C is not viable for its intended purpose.**
+
+The core premise — avoid CRTC/VRAM hardware emulation by redirecting COUT through a custom ROM — only works for the minority of software that uses COUT exclusively. The majority of commercially important software (Apple Writer II, VisiCalc, WordStar, terminal programs) directly accesses the Videx VRAM and CRTC registers. A custom ROM cannot intercept these direct hardware accesses.
+
+If we must support direct VRAM reads/writes and CRTC register access (and we must, for compatibility), then the card already needs the full hardware emulation described in Section 3 — CRTC register file, 2 KB VRAM with read-back, bank selection. At that point, the real Videx ROM works as-is, the VIDEX_LINE renderer displays the output correctly, and there is no benefit to writing a custom ROM. The custom ROM adds development effort and removes compatibility without avoiding the hardware work.
+
+**Approach C's one remaining advantage** — no Videx ROM copyright concern — does not justify the compatibility loss. The ROM copyright question (Section 12.1) is better addressed through user-provided ROM dumps (same approach as every Apple II emulator) or by investigating the ROM's legal status.
+
+**Summary: Approach C works for simple BASIC programs but breaks the software that actually drove Videx adoption.** It is not recommended.
 
 ---
 
