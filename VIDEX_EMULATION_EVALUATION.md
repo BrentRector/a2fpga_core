@@ -697,12 +697,13 @@ With only 4 blocks remaining after the card's baseline needs, the options for ch
 - Allows runtime selection among 3 character sets via config register
 - Tight but feasible; leaves 0 blocks free
 
-**Option C: Build-time selection from full library**
-- `gen_videx_rom.py` fetches all 10 A2DVI character sets
-- User selects which normal set to include at build time (parameter or config)
-- The hex file always contains 1 normal + 1 inverse (4 KB in SSRAM)
-- No BSRAM cost for character ROM; full library available but requires rebuild
-- **Recommended as the practical compromise for the standard board**
+**Option C: Per-character-set firmware releases (recommended)**
+- Produce a separate firmware image for each of the 10 character sets
+- User flashes the image containing their desired character set — directly analogous to physically swapping the EPROM chip in socket U17 on a real Videx VideoTerm
+- Each image contains 1 normal + 1 inverse (4 KB in SSRAM); no BSRAM cost for character ROM
+- `gen_videx_rom.py` enhanced to accept a `--charset` parameter; build system produces 10 variants
+- Full library of character sets available; user experience mirrors the original hardware
+- **Recommended as the practical default for the standard board**
 
 **Option D: Enhanced board gets full runtime selection**
 - On a2n20v2-Enhanced (18 free blocks): use the 32 KB banked ROM approach
@@ -753,9 +754,9 @@ Character ROM: 32 KB BSRAM (banked)
 
 ### 13.8 Phase Recommendation
 
-Multiple character set support is **Phase 5** (Refinements). Initial implementation should use the current single-set SSRAM approach (Option A) with build-time character set selection (Option C). This avoids BSRAM pressure and keeps the initial card implementation focused on correctness.
+Per-character-set firmware releases (Option C) should be the default approach. The build system enhancement is low-effort — add a `--charset` parameter to `gen_videx_rom.py` and produce 10 firmware images. This gives users the full character set library from day one, uses zero additional BSRAM, and mirrors the real Videx experience of physically selecting which character ROM chip to install.
 
-The `gen_videx_rom.py` enhancement to fetch all 10 sets and accept a `--charset` parameter is low-effort and should be done early so users can select their preferred character set from day one.
+Runtime character set switching (Option B/D) is **Phase 5** and depends on BSRAM availability on the target board.
 
 ---
 
