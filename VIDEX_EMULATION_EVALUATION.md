@@ -32,7 +32,9 @@ Both paths exist in the synthesized bitstream when `VIDEX_SUPPORT=1`. The questi
 
 ## 3. What Both Approaches Share: The Virtual Card Front End
 
-Regardless of rendering approach, a new virtual card module (`videx_card.sv`) is needed. This is identical for both approaches:
+Regardless of rendering approach, a new virtual card module (`videx_card.sv`) is needed. This is identical for both approaches.
+
+**Critical distinction:** The existing Videx shadow logic in `apple_memory.sv` is **passive** — it snoops bus writes that a real Videx card handles and stores copies for the renderer. Without a real card present, the emulated card must **actively implement every hardware behavior** that software depends on. The shadow was designed to observe; the card must replace.
 
 ### 3.1 Card Module (implements `slot_if`)
 - Assigned to slot 3 with a unique card ID
@@ -44,24 +46,79 @@ Regardless of rendering approach, a new virtual card module (`videx_card.sv`) is
 - 2 KB at $C800-$CFFF (expansion ROM, full terminal driver)
 - Drives `data_o` onto bus during CPU reads (same as SSC ROM serving)
 - Videx VideoTerm ROM 2.4 stored as `.hex` in BSRAM
+- Expansion ROM ownership protocol: set flag on $C300-$C3FF access, clear on $CFFF
 
-### 3.3 MC6845 CRTC Register File
-- 16 registers accessed via index port ($C0B0 even) / data port ($C0B1 odd)
-- Read support: return R14/R15 on reads (cursor position, firmware reads these)
-- R0-R13 write-only (matches real MC6845 behavior)
-- Bank selection: address bits [3:2] select VRAM bank (0-3)
+### 3.3 MC6845 CRTC Register Emulation
 
-### 3.4 VRAM (2 KB, read/write)
-- 4 banks x 512 bytes at $CC00-$CDFF
-- Must support CPU reads (the shadow mode only captures writes)
-- The existing `sdpram32` pattern already handles the write side
-- Read-back requires either a second read port or time-multiplexed access
+The card must emulate the MC6845 CRTC's register behavior, not just capture writes:
 
-### 3.5 Bus Response Wiring
+**Register I/O protocol ($C0Bx):**
+- Even addresses ($C0B0, $C0B2, ...): latch 5-bit register index
+- Odd addresses ($C0B1, $C0B3, ...): read or write the indexed register
+- ALL $C0Bx accesses: capture bits [3:2] for VRAM bank selection
+
+**Write behavior by register:**
+| Register | Write Effect | Shadow Captures? | Card Must Emulate |
+|----------|-------------|-------------------|-------------------|
+| R0-R3 | Horizontal timing | No | Store value (R0-R3 are write-only on MC6845; no read-back needed; HDMI handles timing independently) |
+| R4-R7 | Vertical timing | No | Store value (same — timing is irrelevant to HDMI output) |
+| R8 | Interlace mode | No | Store value; renderer assumes R8=0 (no interlace) |
+| R9 | Max scanline | Yes → `VIDEX_CRTC_R9` | Store value; if ≠ 8, rendering geometry may break |
+| R10-R11 | Cursor shape/blink | Yes → `VIDEX_CRTC_R10/R11` | Store value; renderer uses for cursor appearance |
+| R12-R13 | Display start addr | Yes → `VIDEX_CRTC_R12/R13` | Store value; renderer uses for hardware scrolling |
+| R14-R15 | Cursor position | Yes → `VIDEX_CRTC_R14/R15` | **Store value AND support read-back** (see below) |
+
+**Read behavior (CRITICAL):**
+On the real MC6845, R14 and R15 are **read-write**. When software reads $C0B1 with index 14 or 15, the MC6845 returns the cursor position. This is essential for:
+- **Card detection:** Software writes a test value to R14, reads it back — if it matches, a Videx is present
+- **Cursor position queries:** Firmware and applications read R14/R15 to find the current cursor location
+- The current shadow has **NO read-back path** — it only captures writes. The emulated card must actively drive `data_o` with R14/R15 values during reads.
+
+**VRAM bank selection:**
+Any access to $C0Bx (read or write, even or odd) causes the card to capture address bits [3:2] as the VRAM bank selector. This determines which 512-byte bank within the 2 KB VRAM is addressed by subsequent $CC00-$CDFF accesses. The shadow does this too (`videx_bankofs <= {addr[3:2], 9'b0}`, `apple_memory.sv:200`), but the card must replicate it independently for its own VRAM addressing.
+
+### 3.4 VRAM Emulation (2 KB, read/write)
+
+The card must actively manage 2 KB of VRAM (4 banks × 512 bytes):
+
+**Writes ($CC00-$CDFF):**
+- CPU writes to $CC00-$CDFF store a byte at `bankofs + addr[8:0]`
+- The shadow already captures these writes (it snoops the bus)
+- The card must also store the write in its own VRAM for read-back
+
+**Reads ($CC00-$CDFF) — CRITICAL GAP:**
+- The shadow provides **NO read-back** to the CPU — its read port is dedicated to the video scanner
+- The emulated card must return the stored VRAM byte on CPU reads
+- This is essential: advanced programs (WordStar, Apple Writer II) read VRAM directly
+- Requires the card to maintain its own 2 KB VRAM copy (simplest: dedicated BSRAM block)
+
+### 3.5 How Shadow and Card Interact
+
+When the emulated card is on the bus:
+1. CPU writes to $C0B1 → card accepts the write → same bus transaction is visible to the shadow → shadow captures the same value
+2. CPU writes to $CC00 → card accepts the write → shadow captures the same write
+3. CPU reads $C0B1 → **only the card responds** (shadow has no read path)
+4. CPU reads $CC00 → **only the card responds** (shadow has no read path)
+
+This means the shadow continues to passively capture the SAME data it always has (CRTC registers and VRAM writes), feeding the VIDEX_LINE renderer. The card handles all the response behavior the shadow cannot provide (ROM serving, register read-back, VRAM read-back, bus driving).
+
+### 3.6 Bus Response Wiring
 - `data_o`, `rd_en_o` signals muxed into the top-level bus multiplexer
 - Same pattern as existing cards: `data_out_w = videx_rd ? videx_d_w : ...`
 
-**Estimated effort for the shared front end: ~300-400 lines of SystemVerilog.** This is the same regardless of rendering approach.
+### 3.7 Complete Side-Effect Summary
+
+| Access | Address | Card Active Response | Shadow Passive Capture |
+|--------|---------|---------------------|----------------------|
+| ROM read | $C300-$C3FF | Drive firmware byte onto bus | — |
+| Expansion ROM read | $C800-$CFFF | Drive ROM byte (if owns $C800) | — |
+| CRTC index write | $C0B0 (even) | Latch index; update bank select | Latch index; update bank select |
+| CRTC data write | $C0B1 (odd) | Store to register file | Store to shadow regs (R9-R15) |
+| CRTC data read | $C0B1 (odd) | **Return R14/R15 on bus** | **Nothing (gap)** |
+| VRAM write | $CC00-$CDFF | Store in card VRAM | Store in shadow VRAM |
+| VRAM read | $CC00-$CDFF | **Return byte from card VRAM** | **Nothing (gap)** |
+
+**Estimated effort for the shared front end: ~400-500 lines of SystemVerilog.** This is the same regardless of rendering approach.
 
 ---
 
@@ -591,123 +648,147 @@ Storage: distributed SSRAM (LUT-based), ~150 SSRAM units
 
 The ROM is generated by `tools/gen_videx_rom.py`, which fetches only `videx_normal.c` and `videx_inverse.c` from the A2DVI GitHub.
 
-### 13.4 Evaluating "Full Character ROM on the Board"
+### 13.4 BSRAM Budget Reality
 
 **Is the full character ROM data currently loaded?** No. Only 1 of 10 normal character sets is present.
 
-**Does the FPGA have capacity for all 10?** Yes, with a storage architecture change. The GW2AR-18C (Tang Nano 20K) has:
-- **828 Kbits of BSRAM** across 46 blocks (each 18 Kbit / ~2.25 KB)
-- **41,472 bits of distributed SSRAM** (~5 KB, synthesized from LUTs)
-
-The data requirements:
-| Configuration | Bytes | BSRAM Blocks (approx) | % of 46 blocks |
-|--------------|-------|----------------------|-----------------|
-| Current: 1 normal + 1 inverse | 4,096 | 0 (in SSRAM) | 0% |
-| All 10 normal + 1 inverse | 22,528 | 10-12 | 22-26% |
-| All 10 normal + 10 inverse | 40,960 | 18-20 | 39-43% |
-
-**The problem:** The current Videx character ROM is stored in **distributed SSRAM** (LUT-based, `apple_video.sv:211`). Expanding from 4 KB to 22 KB in SSRAM is not feasible — the GW2AR-18C has only ~5 KB of distributed SSRAM total, shared with the Apple IIe character ROM (`viderom_r`, another 4 KB at line 200) and any other inferred ROMs. 22 KB of distributed SSRAM would consume more LUTs than are available.
-
-**The solution:** Move the Videx character ROM from distributed SSRAM to **BSRAM**, then expand it. The GW2AR-18C has 828 Kbits (103.5 KB) of BSRAM. Using 10-12 blocks for 22 KB of character data is ~22-26% of total BSRAM — significant but feasible, especially since the Apple II's main 64 KB RAM lives in external SDRAM, not BSRAM.
-
-### 13.5 Proposed Architecture: Multi-Character-Set Support
-
-**Recommended approach: single expanded BSRAM ROM with configuration register**
+**Does the FPGA have capacity for all 10?** This is constrained. The synthesis report for the a2n20v2 board (`boards/a2n20v2/impl/pnr/a2n20v2.rpt.txt`) shows:
 
 ```
-ROM organization:
-  Size: 32,768 entries × 8 bits (32 KB, 15-bit address)
-  Layout:
-    Bank 0 (0x0000-0x07FF): US Normal
-    Bank 1 (0x0800-0x0FFF): Uppercase
-    Bank 2 (0x1000-0x17FF): German
-    Bank 3 (0x1800-0x1FFF): French
-    Bank 4 (0x2000-0x27FF): Spanish
-    Bank 5 (0x2800-0x2FFF): Katakana
-    Bank 6 (0x3000-0x37FF): APL
-    Bank 7 (0x3800-0x3FFF): Super/Sub
-    Bank 8 (0x4000-0x47FF): Epson
-    Bank 9 (0x4800-0x4FFF): Symbol
-    Bank 10-15: unused (available for custom sets)
-    + Inverse bank at a known location (e.g., Bank 15 or separate)
-
-Addressing during rendering:
-  if (char_code[7] == 0)  // Normal character
-    rom_addr = {config_set_select[3:0], char_code[6:0], scanline[3:0]}
-  else                    // Inverse character (bit 7 set)
-    rom_addr = {INVERSE_BANK[3:0],     char_code[6:0], scanline[3:0]}
-
-Configuration register:
-  - 4-bit register: selects normal character set bank (0-9, expandable to 15)
-  - Accessible via: Videx card device I/O ($C0Bx), or config_select mechanism
-  - Default: 0 (US Normal)
+GW2AR-18C BSRAM utilization: 40/46 blocks (87%)
+  28 SDPB + 8 DPB + 2 DPX9B + 2 pROM = 40 blocks used
+  6 blocks free (~13.5 KB)
 ```
 
-**BSRAM cost:** 32 KB = 262,144 bits = ~15 BSRAM blocks (33% of 46). This is conservative — uses 16 banks of 2 KB (power-of-2 for clean addressing) even though only 11 are populated.
+The Videx emulated card itself needs BSRAM:
+| Card Component | BSRAM Blocks |
+|---------------|-------------|
+| Firmware ROM (2 KB) | 1 |
+| Card VRAM for CPU read-back (2 KB) | 1 |
+| **Subtotal: card baseline** | **2** |
+| **Remaining for character ROM** | **4 blocks (~9 KB)** |
 
-**Alternative: tighter packing** — 11 banks of 2 KB = 22 KB, but the non-power-of-2 bank count complicates address decoding. A 4-bit bank select with 16 banks is cleaner.
+With only 4 blocks remaining after the card's baseline needs, the options for character ROM are severely constrained:
 
-### 13.6 Implementation Changes
+| Configuration | Bytes | Blocks Needed | Fits in 4? |
+|--------------|-------|---------------|------------|
+| Current: 1 normal + 1 inverse (SSRAM) | 4,096 | 0 (stays in SSRAM) | Yes |
+| 4 normal + 1 inverse | 10,240 | 5-6 | No |
+| All 10 normal + 1 inverse | 22,528 | 10-12 | No |
+| 32 KB banked ROM (16 banks) | 32,768 | 15 | No |
+
+**The 32 KB banked ROM approach proposed earlier is NOT feasible on the standard a2n20v2.** It would need 15 blocks but only 4 are available after card baseline allocation.
+
+(Note: the a2n20v2-Enhanced board uses only 28/46 blocks (61%), leaving 18 free — enough for the full multi-set ROM. But the standard board is the primary target.)
+
+### 13.5 Feasible Approaches Given BSRAM Constraints
+
+**Option A: Keep current SSRAM, single character set (recommended for initial implementation)**
+- Keep the 4 KB Videx char ROM in distributed SSRAM (~150 SSRAM units, as today)
+- Only 1 normal + 1 inverse set available
+- Card firmware ROM (2 KB) and VRAM read-back (2 KB) use 2 BSRAM blocks
+- 4 blocks remain free for other future needs
+- User selects character set at build time by regenerating `videx_charrom.hex`
+
+**Option B: Move char ROM to BSRAM, fit 2-3 selectable sets**
+- Move the Videx char ROM from SSRAM to BSRAM, freeing ~150 SSRAM units
+- Expand to 3 normal sets + 1 inverse = 4 × 2 KB = 8 KB ≈ 4 BSRAM blocks
+- Combined with card baseline: 2 + 4 = 6 blocks total (all 6 free blocks used)
+- Allows runtime selection among 3 character sets via config register
+- Tight but feasible; leaves 0 blocks free
+
+**Option C: Build-time selection from full library**
+- `gen_videx_rom.py` fetches all 10 A2DVI character sets
+- User selects which normal set to include at build time (parameter or config)
+- The hex file always contains 1 normal + 1 inverse (4 KB in SSRAM)
+- No BSRAM cost for character ROM; full library available but requires rebuild
+- **Recommended as the practical compromise for the standard board**
+
+**Option D: Enhanced board gets full runtime selection**
+- On a2n20v2-Enhanced (18 free blocks): use the 32 KB banked ROM approach
+- On standard a2n20v2 (6 free blocks): fall back to Option A or C
+- Make the ROM size a synthesis parameter: `VIDEX_CHARSET_COUNT`
+
+### 13.6 Proposed Architecture
+
+For the initial implementation (Option A/C):
+```
+Character ROM: 4 KB SSRAM (unchanged from current passive shadow)
+  Entries 0x000-0x7FF: Selected normal set (default: US)
+  Entries 0x800-0xFFF: Inverse
+  Addressing: videxrom_a_r = {char[7:0], scanline[3:0]}  (12 bits)
+  Character set selection: build-time (gen_videx_rom.py parameter)
+```
+
+For enhanced boards or future BSRAM optimization (Option D):
+```
+Character ROM: 32 KB BSRAM (banked)
+  Size: 32,768 entries × 8 bits (15-bit address)
+  Layout: 16 banks × 128 chars × 16 bytes/char
+    Banks 0-9: US, Uppercase, German, French, Spanish, Katakana, APL, Super/Sub, Epson, Symbol
+    Bank 15: Inverse
+  Addressing:
+    if (char_code[7] == 0)  // Normal character
+      rom_addr = {config_set_select[3:0], char_code[6:0], scanline[3:0]}
+    else                    // Inverse character (bit 7 set)
+      rom_addr = {INVERSE_BANK[3:0],     char_code[6:0], scanline[3:0]}
+  Configuration register: 4-bit, selects normal set bank (0-9)
+```
+
+### 13.7 Implementation Changes
 
 **`tools/gen_videx_rom.py`:**
 - Expand to fetch all 10 A2DVI character sets + inverse
-- Generate a combined hex file with bank-aligned layout
-- Output: `videx_charrom.hex` grows from 4,096 to 32,768 lines
+- Add `--charset` parameter to select which normal set to include (default: US)
+- For single-set mode: output 4,096-line hex file (as today)
+- For multi-set mode: output 32,768-line hex file with bank layout
 
-**`hdl/video/apple_video.sv`:**
-- Replace distributed SSRAM ROM with BSRAM-backed ROM:
-  ```verilog
-  // Before (SSRAM, 4 KB):
-  reg [7:0] videxrom_r[4095:0];
-  initial $readmemh("videx_charrom.hex", videxrom_r, 0);
+**`hdl/video/apple_video.sv` (multi-set only):**
+- Expand ROM array and address width
+- Add bank select mux on char code bit 7
 
-  // After (BSRAM, 32 KB):
-  reg [7:0] videxrom_r[32767:0];
-  initial $readmemh("videx_charrom.hex", videxrom_r, 0);
-  ```
-  Gowin synthesis infers BSRAM for arrays this large (well above the SSRAM threshold).
+**`hdl/videx/videx_card.sv` (multi-set only):**
+- Add configuration register for character set selection
+- Accessible via `slot_if.card_config` mechanism or unused CRTC register index
 
-- Modify ROM address calculation to include bank select:
-  ```verilog
-  // Before:
-  videxrom_a_r <= {videx_data_r[7:0], videx_scanline_w};
+### 13.8 Phase Recommendation
 
-  // After:
-  wire [3:0] videx_char_bank_w = videx_data_r[7] ?
-      INVERSE_BANK : videx_charset_select_r;
-  videxrom_a_r <= {videx_char_bank_w, videx_data_r[6:0], videx_scanline_w};
-  ```
+Multiple character set support is **Phase 5** (Refinements). Initial implementation should use the current single-set SSRAM approach (Option A) with build-time character set selection (Option C). This avoids BSRAM pressure and keeps the initial card implementation focused on correctness.
 
-**`hdl/videx/videx_card.sv` (new):**
-- Add a configuration register for character set selection
-- Accessible via an unused CRTC register index (R16+ or a dedicated $C0Bx address)
-- Default to US Normal (bank 0)
-
-**Configuration UI:**
-- On the Apple II side: a setup utility (potentially on the card's ROM) or configuration through the A2FPGA config mechanism
-- On the A2FPGA side: the existing `slot_if.card_config` mechanism could carry the character set selection from the config system to the card
-
-### 13.7 Phase Recommendation
-
-Multiple character set support is not needed for initial Videx card emulation. It can be added in Phase 5 (Refinements) after the basic card is working with the US Normal + Inverse set.
-
-However, the BSRAM migration should be considered early: if the character ROM is going to move from SSRAM to BSRAM anyway, doing it from the start avoids rework.
+The `gen_videx_rom.py` enhancement to fetch all 10 sets and accept a `--charset` parameter is low-effort and should be done early so users can select their preferred character set from day one.
 
 ---
 
 ## 14. Resource Summary (Approach B)
 
-| Resource | Existing (shadow) | New (card) | Total |
-|----------|-------------------|------------|-------|
-| Firmware ROM | — | 2 KB BSRAM | 2 KB |
-| CRTC register file | 128 FFs (in shadow) | Duplicated or shared | 128 FFs |
-| VRAM (scanner-facing) | 2 KB BSRAM (shadow) | — | 2 KB |
-| VRAM (CPU read-back) | — | 2 KB BSRAM (if Option A) | 2 KB |
-| Videx character ROM | 4 KB SSRAM (shadow) | — | 4 KB |
-| Videx character ROM (multi-set) | 32 KB BSRAM (if enabled) | — | 32 KB |
-| Bus response logic | — | ~200 LUTs | ~200 LUTs |
-| VIDEX_LINE pipeline | Existing | — | Existing |
-| **Total new (single set)** | | **2-4 KB BSRAM + ~200 LUTs** | |
-| **Total new (multi-set)** | | **34-36 KB BSRAM + ~200 LUTs** | |
+### 14.1 Actual BSRAM Budget
 
-With a single character set, this is comparable to the Super Serial Card's resource footprint. With all 10 character sets, it uses ~33% of BSRAM — significant but feasible given that main Apple II RAM is in external SDRAM, leaving BSRAM available for peripheral resources.
+From synthesis report (`boards/a2n20v2/impl/pnr/a2n20v2.rpt.txt`):
+```
+BSRAM: 40/46 blocks used (87%)
+Free: 6 blocks (~13.5 KB)
+```
+
+### 14.2 Resource Allocation
+
+| Resource | Existing (shadow) | New (card) | BSRAM Blocks |
+|----------|-------------------|------------|-------------|
+| Firmware ROM | — | 2 KB BSRAM | **1** |
+| CRTC register file | 128 FFs (shadow) | 128 FFs (card) | 0 |
+| VRAM (scanner-facing) | 2 KB BSRAM (shadow) | — | 0 (existing) |
+| VRAM (CPU read-back) | — | 2 KB BSRAM | **1** |
+| Videx character ROM (single set) | 4 KB SSRAM | — | 0 (stays in SSRAM) |
+| Bus response logic | — | ~200 LUTs | 0 |
+| VIDEX_LINE pipeline | Existing | — | 0 (existing) |
+| **Total new BSRAM** | | | **2 blocks** |
+| **Remaining free** | | | **4 blocks** |
+
+### 14.3 Multi-Character-Set Cost (if enabled)
+
+| Configuration | Additional BSRAM | Total Card BSRAM | Remaining Free |
+|--------------|-----------------|-----------------|----------------|
+| Single set (SSRAM, default) | 0 | 2 blocks | 4 blocks |
+| 3 selectable sets + inverse | 4 blocks (replaces SSRAM) | 6 blocks | 0 blocks |
+| All 10 sets (Enhanced board only) | 15 blocks | 17 blocks | n/a (needs Enhanced) |
+
+With a single character set, the card uses only 2 of 6 available BSRAM blocks — a comfortable fit. Multi-set support on the standard board is tight but possible for a small number of sets.
