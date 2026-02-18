@@ -283,40 +283,199 @@ The Videx shadow path was built to render Videx output faithfully. Promoting it 
 
 ---
 
-## 8. Implementation Plan (Approach B)
+## 8. How Software Interacts with the Emulated Card
 
-### Phase 1: Virtual Card Module
-1. Create `hdl/videx/videx_card.sv` implementing `slot_if`
-2. Add card ID to the slot system (e.g., ID=5)
-3. Implement firmware ROM serving ($C300-$C3FF, $C800-$CFFF)
-4. Implement CRTC register file with read-back (R14/R15)
-5. Implement VRAM bank selection and write handling
-6. Implement VRAM CPU read-back (time-multiplexed or buffered)
+This is the critical section. The virtual card must present a complete Videx hardware and software interface — firmware ROM, CRTC registers, and VRAM — so that Apple ][/][+ software can discover, initialize, and use the 80-column adapter exactly as it would a real Videx VideoTerm. Both approaches A and B require the identical bus-facing card module described here; they differ only in the rendering back end.
 
-### Phase 2: Integration
-1. Wire card into board top-level (`top.sv`) with `data_o`/`rd_en_o`
-2. Add to bus data multiplexer alongside existing cards
-3. Verify the existing CRTC capture and VRAM shadow logic works with the card's bus responses
-4. Ensure `VIDEX_MODE` activates correctly from the card's CRTC initialization
-5. Verify AN0 is set by the Videx firmware through normal annunciator access
+### 8.1 PR#3: Activating the Videx Card
 
-### Phase 3: Testing
-1. Test with Videx firmware initialization (CRTC setup, VRAM clear)
-2. Test character output (Apple Writer II, WordStar, CP/M)
-3. Test hardware scrolling
-4. Test cursor positioning and blink modes
-5. Test on actual Apple ][+ hardware
+When the user types `PR#3` at the Applesoft BASIC prompt, the Apple II firmware executes this sequence:
 
-### Phase 4: Refinements
+```
+1. CPU reads $C300        ← Slot 3 ROM entry point
+   └─ slotmaker decodes addr[10:8]=3, asserts io_select_n for slot 3
+   └─ videx_card sees io_select_n LOW, drives firmware ROM byte onto data_o
+   └─ apple_memory sets SLOTROM=3 and INTC8ROM=1 (slot 3 claims $C800 space)
+
+2. Firmware at $C300 contains a JMP to $C800+ expansion ROM
+   CPU reads $C800-$CFFF  ← Expansion ROM
+   └─ slotmaker decodes addr[15:11]=5'b11001, asserts io_strobe_n
+   └─ videx_card sees io_strobe_n LOW + rom ownership, drives ROM bytes
+
+3. Videx firmware in expansion ROM executes initialization:
+   a. Writes to $C0B0 (even): set CRTC register index
+      └─ slotmaker decodes addr[6:4]=3, asserts dev_select_n
+      └─ videx_card captures index value
+      └─ apple_memory shadow also captures (snoops same bus write)
+
+   b. Writes to $C0B1 (odd): write CRTC register data
+      └─ videx_card stores register value
+      └─ apple_memory shadow stores same value in videx_crtc_regs[]
+      └─ First CRTC write sets videx_mode_r = 1 (Videx detected)
+
+   c. Firmware programs CRTC R0-R8 (timing), R9 (max scanline = 8),
+      R10-R11 (cursor), R12-R13 (display start = 0)
+
+   d. Firmware writes to $CC00-$CDFF: clear VRAM
+      └─ videx_card handles write (bank select from prior $C0Bx access)
+      └─ apple_memory shadow captures same writes into videx_vram
+
+   e. Firmware writes $C059: set AN0 (annunciator 0 ON)
+      └─ apple_memory captures AN0=1
+      └─ apple_video mode select: videx_mode_r & text_mode_r & an0_r → VIDEX_LINE
+
+   f. Firmware patches CSW ($36/$37): redirect COUT to Videx output routine
+      └─ All subsequent text output goes through Videx firmware
+      └─ Firmware writes characters to VRAM, updates CRTC cursor position
+
+4. Result: 80-column text appears on HDMI via VIDEX_LINE rendering
+```
+
+This is identical to what happens with a real Videx card in a real Apple ][+. The FPGA's virtual card responds on the bus; the 6502 CPU runs the actual Videx firmware ROM; the firmware initializes the hardware and patches into the Apple II OS.
+
+### 8.2 Software Detection: Finding the Videx
+
+Programs detect Videx-compatible cards using several methods:
+
+**A. ROM signature bytes** — Most Videx-aware software reads specific bytes from $C300-$C3FF to identify the card. The Videx VideoTerm ROM contains known signature bytes at fixed offsets. Since the virtual card serves the actual Videx ROM, these checks pass automatically.
+
+**B. CRTC probe** — Some software writes a value to a CRTC register via $C0B0/$C0B1 and reads it back (R14/R15 are readable on the MC6845). If the read-back matches, a Videx is present. The virtual card must support reads from $C0B1 returning R14/R15 data. This is the CRTC read-back requirement listed in Section 3.3.
+
+**C. PR#3 and IN#3** — The simplest detection: if `PR#3` doesn't crash and produces 80-column output, the card is present. This works because the virtual card serves valid firmware ROM.
+
+**D. Slot scan** — ProDOS and some applications scan slots 1-7 by reading $Cn00 and checking for device type signatures. The Videx ROM at $C300 contains the proper identification byte.
+
+### 8.3 The Videx API: How Applications Use 80-Column Output
+
+The Videx VideoTerm API is entirely software — it's the 6502 firmware code in the ROM. The FPGA provides hardware support; the firmware provides the API:
+
+**Standard output (most applications):**
+```
+Application calls COUT ($FDED)
+  → Apple II ROM checks CSW ($36/$37), which Videx firmware patched to point to $C300+
+  → CPU jumps to Videx firmware in $C800 expansion ROM
+  → Firmware writes character to VRAM at cursor position ($CC00-$CDFF)
+  → Firmware advances cursor (updates CRTC R14/R15)
+  → Firmware handles scroll if needed (updates CRTC R12/R13, writes new line to VRAM)
+  → Return to application
+```
+
+**Control codes (cursor movement, clear screen, etc.):**
+```
+Videx firmware interprets control characters:
+  $08 (BS)  → move cursor left
+  $0A (LF)  → move cursor down, scroll if at bottom
+  $0C (FF)  → clear screen (writes spaces to all VRAM, resets R12-R15)
+  $0D (CR)  → move cursor to start of line
+  $15 (NAK) → home cursor
+  etc.
+```
+
+**Direct VRAM access (advanced programs like WordStar, Apple Writer II):**
+```
+Some programs bypass the firmware API and write directly to VRAM:
+  1. Select VRAM bank: access $C0B0-$C0BF (address bits [3:2] select bank)
+  2. Write character: store byte at $CC00-$CDFF
+  3. Update cursor: write CRTC R14/R15 via $C0B0/$C0B1
+```
+
+All of these work automatically because:
+- The CPU runs real Videx firmware code (served from the card's ROM)
+- CRTC register writes are handled by the card AND snooped by the shadow
+- VRAM writes are handled by the card AND snooped by the shadow
+- The VIDEX_LINE renderer reads from the shadow VRAM and CRTC registers
+
+### 8.4 Key Insight: The Firmware IS the API
+
+The Videx "API" is not something the FPGA implements — it's 6502 code in the firmware ROM that the Apple ][+ CPU executes natively. The FPGA's job is to provide:
+
+1. **ROM bytes on demand** — so the CPU can execute the firmware
+2. **MC6845 register I/O** — so the firmware can program the display hardware
+3. **VRAM read/write** — so the firmware can store and retrieve character data
+4. **Video output** — so the VRAM contents appear on screen
+
+The virtual card handles #1-3. The existing shadow capture + VIDEX_LINE pipeline handles #4. This is why promoting the shadow path to active emulation is the natural approach — it already does #4, and #1-3 are the same regardless of rendering back end.
+
+---
+
+## 9. 9-Scanline Rendering: Current Status
+
+The VIDEX_LINE rendering path in `apple_video.sv` contains code for 9-scanline character rendering:
+
+- **Vertical geometry** (`apple_video.sv:82-86`): `VIDEX_WINDOW_HEIGHT = 432` (24 rows × 9 scanlines × 2 doubling)
+- **Content Y** (`apple_video.sv:177-178`): `videx_content_y_w` uses `VIDEX_V_BORDER` (24), range 0-215
+- **Division by 9** (`apple_video.sv:180-183`): multiply-shift approximation, exact for 0-215
+- **Scanline extraction** (`apple_video.sv:185-187`): `videx_scanline_w` is 4-bit, ranges 0-8
+- **Character ROM address** (`apple_video.sv:616`): `{char[7:0], videx_scanline_w[3:0]}` — uses 4-bit scanline, NOT the TEXT80 path's 3-bit `window_y_w[2:0]`
+- **Active window** (`apple_video.sv:92-94`): switches to 432-pixel tall window when Videx mode detected
+
+**However:** This code was added in the most recent commit as part of the passive shadow support and has NOT been tested on real hardware. Key risks:
+
+1. **The divide-by-9 approximation** (`content_y * 57 >> 9`) — needs verification that it produces correct row/scanline values for all 216 content lines (0-215)
+2. **The vertical window geometry** — `window_y_w` at line 102 still uses `V_BORDER` (48) not `VIDEX_V_BORDER` (24), which would produce incorrect values for screen lines 24-47. The VIDEX_LINE path uses its own `videx_content_y_w` instead, but any shared logic that depends on `window_y_w` during those lines could malfunction.
+3. **The character ROM** (`videx_charrom.hex`) — needs verification that the 9th scanline data (scanline index 8) is correctly positioned in the ROM file
+4. **Interaction with mixed mode** — the `GR` signal at line 189 depends on `window_y_w`, which may have incorrect values during the extended Videx vertical window
+
+Until these are validated through testing, the 9-scanline rendering should be treated as **implemented but unverified**. This applies equally to both approaches — Approach B uses it directly, while Approach A would need to reimplement it if full 9-scanline fidelity is desired.
+
+---
+
+## 10. Implementation Plan (Approach B)
+
+### Phase 1: Virtual Card Module (`videx_card.sv`)
+1. Create `hdl/videx/videx_card.sv` implementing `slot_if.card`
+2. Add card ID to slot system and update `slots.hex` to assign it to slot 3 (currently empty: `slot_cards[3] = 0`)
+3. Implement firmware ROM storage (2 KB BSRAM, loaded from `videx_rom.hex`)
+4. Implement expansion ROM ownership protocol:
+   - Set ownership flag when $C300-$C3FF is accessed (mirrors `apple_memory.sv` INTC8ROM behavior)
+   - Clear on $CFFF access
+   - Respond to $C800-$CFFF reads when ownership flag is set
+5. Implement MC6845 CRTC register file:
+   - Index port at $C0B0 (even addresses): latch 5-bit register index
+   - Data port at $C0B1 (odd addresses): write register data, read R14/R15
+   - Bank selection from address bits [3:2] on any $C0Bx access
+6. Implement VRAM read/write:
+   - Write: accept byte writes to $CC00-$CDFF with bank offset
+   - Read-back: return stored VRAM byte when CPU reads $CC00-$CDFF
+7. Drive `data_o` and `rd_en_o` for all three address spaces
+
+### Phase 2: Integration into Board Top-Level
+1. Instantiate `videx_card` in `top.sv` alongside existing cards
+2. Add to bus data multiplexer: `data_out_w = videx_rd ? videx_d_w : ...`
+3. Add `rd_en_o` to `data_out_en_w` OR chain
+4. Wire `slot_if` from `slotmaker`
+5. Verify the existing shadow capture logic in `apple_memory.sv` correctly
+   picks up bus transactions generated by the card's interaction with the CPU
+6. Verify `VIDEX_MODE` activates on first CRTC write (existing mechanism)
+7. Verify AN0 set by Videx firmware via normal $C058/$C059 access
+
+### Phase 3: Validate 9-Scanline Rendering
+1. Verify divide-by-9 produces correct row/scanline for all 216 content lines
+2. Verify `videx_charrom.hex` scanline 8 data is correct for all characters
+3. Verify `window_y_w` underflow in lines 24-47 does not affect VIDEX_LINE path
+4. Test character display accuracy against real Videx output
+5. Verify cursor rendering at correct scanline positions
+
+### Phase 4: Software Compatibility Testing
+1. PR#3 activation from Applesoft BASIC prompt
+2. IN#3 for input redirection
+3. Apple Writer II (direct VRAM access)
+4. WordStar under CP/M (heavy 80-column use)
+5. ProDOS slot scan / device detection
+6. Programs that probe CRTC register read-back for card detection
+7. Hardware scrolling behavior (rapid text output)
+8. Test on actual Apple ][+ hardware
+
+### Phase 5: Refinements
 1. Handle edge cases in VRAM read-back timing
 2. Support for Videx-compatible software that directly manipulates CRTC/VRAM
 3. Optional: multiple character set support (Videx supported up to 11 sets)
 
 ---
 
-## 9. Detailed Analysis: What Changes for Each Module
+## 11. Detailed Analysis: What Changes for Each Module
 
-### 9.1 New: `hdl/videx/videx_card.sv` (~400 lines)
+### 11.1 New: `hdl/videx/videx_card.sv` (~400 lines)
 
 ```
 Module ports:
@@ -335,7 +494,7 @@ Internal components:
   - Bus response mux (ROM / CRTC / VRAM read selection)
 ```
 
-### 9.2 Modified: `apple_memory.sv`
+### 11.2 Modified: `apple_memory.sv`
 
 The existing `videx_gen` generate block (lines 175-262) may need minor adjustments:
 - The CRTC capture logic already snoops $C0Bx writes — this continues to work because the CPU's writes to $C0Bx are still visible on the bus even when the card is responding
@@ -343,11 +502,11 @@ The existing `videx_gen` generate block (lines 175-262) may need minor adjustmen
 - **Possible change:** The VRAM read port is currently dedicated to the video scanner. If CPU read-back is needed from this same VRAM (rather than a separate copy in the card), a read-port mux would be added here
 - **Possible change:** Allow `VIDEX_MODE` to be set by the card module directly (belt and suspenders alongside the automatic detection)
 
-### 9.3 Unchanged: `apple_video.sv`
+### 11.3 Unchanged: `apple_video.sv`
 
 No changes needed. The `VIDEX_LINE` rendering path, all geometry calculations, cursor logic, and character ROM lookup work as-is. The video module reads from `videx_vram_data_i` and `a2mem_if.VIDEX_CRTC_R*` — both are populated by the shadow capture logic which continues to function.
 
-### 9.4 Modified: Board `top.sv`
+### 11.4 Modified: Board `top.sv`
 
 - Instantiate `videx_card` module alongside existing cards
 - Add to bus data multiplexer: `data_out_w = videx_rd ? videx_d_w : ...`
@@ -357,34 +516,34 @@ No changes needed. The `VIDEX_LINE` rendering path, all geometry calculations, c
 
 ---
 
-## 10. Open Questions
+## 12. Open Questions
 
-### 10.1 Firmware ROM Source
+### 12.1 Firmware ROM Source
 The Videx VideoTerm ROM is copyrighted. Options:
 - User provides their own ROM dump (loaded via `.hex` file)
 - Open-source terminal firmware (would need to be written)
 - Investigate abandonware/fair-use status
 
-### 10.2 VRAM Read-Back Architecture
+### 12.2 VRAM Read-Back Architecture
 The shadow `sdpram32` read port is used by the video scanner. For CPU reads of $CC00-$CDFF, options:
 - **Option A:** Card maintains its own copy of VRAM for reads (adds 2 KB BSRAM, simplest)
 - **Option B:** Time-multiplex the shadow VRAM read port between scanner and CPU (requires careful timing)
 - **Option C:** Replace `sdpram32` with true dual-port RAM (if FPGA supports it)
 - **Recommendation:** Option A is simplest. 2 KB BSRAM is cheap on the target FPGAs.
 
-### 10.3 Interaction Between Shadow and Emulation
+### 12.3 Interaction Between Shadow and Emulation
 When the emulated card is active, the existing shadow capture logic still runs (it snoops the same bus transactions the card generates). This is actually beneficial — the shadow populates the same VRAM and CRTC registers that the VIDEX_LINE renderer reads. No conflict exists because the shadow and the card agree on the bus state.
 
 However, if both an external Videx card AND the emulated card were active simultaneously (shouldn't happen, but defensive design), there would be bus contention. The card should only be enabled on ][/][+ systems, or when explicitly configured.
 
-### 10.4 Apple ][+ Bus Signal Handling
+### 12.4 Apple ][+ Bus Signal Handling
 The `m2sel_n` signal used in slot decode (`apple_memory.sv:197`, `slotmaker.sv`) is an IIe signal. On a ][/][+:
 - Verify the A2FPGA bus interface drives `m2sel_n` correctly for ][+ (should be active/low for all I/O access)
 - The slot decode logic in `slotmaker.sv` uses `!a2bus_if.m2sel_n` as a guard — this must pass on a ][+
 
 ---
 
-## 11. Resource Summary (Approach B)
+## 13. Resource Summary (Approach B)
 
 | Resource | Existing (shadow) | New (card) | Total |
 |----------|-------------------|------------|-------|
