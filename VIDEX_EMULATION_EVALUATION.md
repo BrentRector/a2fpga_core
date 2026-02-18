@@ -1,565 +1,400 @@
-# Videx VideoTerm Full Emulation via Apple IIe 80-Column Path
+# Videx VideoTerm Full Emulation on Apple ][+
 
-## Evaluation: What Is Needed to Emulate a Videx on an Apple ][+ Using the Existing IIe 80-Column Implementation
+## Evaluation: Architectural Approach for Videx Emulation in A2FPGA
 
 ---
 
 ## 1. Executive Summary
 
-This document evaluates what is required to build a fully self-contained Videx VideoTerm 80-column card emulation within the A2FPGA, targeting Apple ][+ systems, by reusing the existing Apple IIe 80-column text rendering pipeline (`TEXT80_LINE`). The existing Videx "shadow" support (`VIDEX_LINE`) is a passive monitor that requires an external A2DVI card and is not relevant to this effort.
+This document evaluates two fundamentally different architectural approaches for building a fully self-contained Videx VideoTerm 80-column card emulation within the A2FPGA, targeting Apple ][+ systems where no external Videx hardware exists.
 
-The proposed approach creates a new virtual slot card that actively emulates the Videx hardware interface (firmware ROM, MC6845 CRTC registers, 2 KB VRAM) and translates all Videx state into the IIe internal representation so that the existing `TEXT80_LINE` rendering pipeline produces the display output. No external Videx or A2DVI card is required.
+**The central question:** Should the emulated Videx card translate its operations into the IIe 80-column representation and render through the existing `TEXT80_LINE` pipeline? Or should it build upon the newly added Videx shadow rendering pipeline (`VIDEX_LINE`) by promoting it from passive monitoring to active emulation?
 
-**Key finding:** The approach is feasible but involves five distinct engineering challenges: (1) active bus response for the card interface, (2) Videx-to-IIe address translation for the scrambled text page layout, (3) character encoding translation between the two different schemes, (4) handling Videx hardware scrolling by re-syncing the full screen, and (5) the 9-vs-8 scanline visual difference. Each is analyzed in detail below.
+**Key finding:** Both approaches share the same "front end" — a new virtual card module that provides firmware ROM, MC6845 CRTC register emulation, and 2 KB VRAM with full read/write support. They differ only in the "back end" — how VRAM content reaches the screen.
 
----
-
-## 2. System Comparison: Videx VideoTerm vs Apple IIe 80-Column
-
-| Aspect | Videx VideoTerm | Apple IIe 80-Column |
-|--------|----------------|---------------------|
-| **Target machine** | Apple ][, ][+ | Apple IIe, IIc |
-| **Physical slot** | Slot 3 (required) | Built-in (no slot) |
-| **Display chip** | MC6845 CRTC | Custom IOU/MMU |
-| **VRAM** | 2 KB on-card, linear | Aux RAM at $0400-$0BFF, scrambled |
-| **VRAM addressing** | Linear: `base + row*80 + col` | Apple II text page: scrambled interleave |
-| **Character height** | 9 scanlines (R9=8, lines 0-8) | 8 scanlines (lines 0-7) |
-| **Character width** | 7 pixels | 7 pixels |
-| **Active display** | 560 x 216 (doubled to 560 x 432) | 560 x 192 (doubled to 560 x 384) |
-| **HDMI output region** | 720 x 480, 24 px V border | 720 x 480, 48 px V border |
-| **Character encoding** | Direct: $00-$7F normal, $80-$FF inverse | Complex: inverse/flash/normal/alt zones |
-| **Character ROM** | Separate 4 KB ROM (videx_charrom.hex) | Apple IIe ROM (video.hex) |
-| **Hardware scrolling** | Yes (CRTC R12/R13 display start) | No (software must move bytes) |
-| **Cursor** | MC6845 R10-R15 (blink modes, position) | Firmware-driven (flashing character) |
-| **Activation** | Firmware in slot 3 ROM + AN0 | COL80 soft switch ($C00D) |
-| **Mixed mode** | Not supported | Supported (text + graphics) |
-| **Character sets** | Up to 11 (bank-switched) | 2 (standard + alternate/MouseText) |
+**Recommendation:** Build upon the existing Videx shadow implementation (`VIDEX_LINE`). It is superior on all three axes: **smaller** (no translation logic), **faster** (no sync latency, native scroll support), and **simpler to maintain** (self-contained, no cross-subsystem coupling).
 
 ---
 
-## 3. Current A2FPGA Architecture (Relevant Modules)
+## 2. Context: Why These Are the Only Two Approaches
 
-### 3.1 Text Memory Shadow (`apple_memory.sv:348-359`)
+On an Apple ][/][+, no software will ever activate IIe 80-column mode — the COL80 soft switch, STORE80, auxiliary RAM, and the entire IIe memory banking mechanism simply don't exist on these machines. Any 80-column software running on a ][/][+ will look for and expect a **Videx adapter** specifically.
 
-The IIe text page is stored in a 1024 x 32-bit BSRAM (`text_vram`). Each 32-bit word holds 4 bytes organized as:
+The A2FPGA already has two complete 80-column rendering paths:
 
-```
-Byte 0 [7:0]   = main RAM, even address
-Byte 1 [15:8]  = aux  RAM, even address
-Byte 2 [23:16] = main RAM, odd address
-Byte 3 [31:24] = aux  RAM, odd address
-```
+1. **`TEXT80_LINE`** — Renders IIe-style 80-column text from the interleaved main/aux `text_vram`. Active on an Apple IIe when `COL80=1`. **Dead code on a ][/][+** since nothing ever sets `COL80`.
 
-**Write address** (from Apple II bus):
-```verilog
-wire [11:0] text_write_offset = {!addr[10], addr[9:0], E1};
-// write_addr = text_write_offset[11:2]  (10-bit word address)
-// byte_enable = 1 << text_write_offset[1:0]
-// where E1 = aux_mem_r || m2b0
-```
+2. **`VIDEX_LINE`** — Renders Videx-style 80-column text from the separate `videx_vram` with its own character ROM, 9-scanline geometry, cursor logic, and hardware scrolling support. Currently passive (shadows an external card). **Already Videx-native.**
 
-On an Apple ][+, `E1` is always 0 (no auxiliary memory), so only byte positions 0 and 2 (main bank) are ever written. The aux bank (bytes 1 and 3) remains empty.
-
-**Read address** (from video scanner):
-```verilog
-wire [9:0] text_read_offset = {!video_address[10], video_address[9:1]};
-```
-
-### 3.2 TEXT80 Rendering Pipeline (`apple_video.sv:578-612`)
-
-The TEXT80 pipeline processes 4 characters per 28-pixel cycle:
-
-| Stage | Buffer Position | Source Byte | Screen Column |
-|-------|----------------|-------------|---------------|
-| TEXT_0 + TEXT80_2 | `[13:7]` | `video_data_r[7:0]` (main, even) | col N+1 |
-| TEXT80_1 + TEXT80_3 | `[6:0]` | `video_data_r[15:8]` (aux, even) | col N (leftmost) |
-| TEXT80_3 + TEXT80_4 | `[27:21]` | `video_data_r[23:16]` (main, odd) | col N+3 |
-| TEXT80_3 + TEXT80_5 | `[20:14]` | `video_data_r[31:24]` (aux, odd) | col N+2 |
-
-Display order (left to right): aux-even, main-even, aux-odd, main-odd.
-
-Each character is mapped through the IIe character ROM (`video.hex`) with the address encoding:
-```verilog
-viderom_a_r = {1'b0,
-    data[7] | (data[6] & flash_clk & ~altchar),  // bit 10: inverse/flash
-    data[6] & (altchar | data[7]),                // bit 9: alt charset
-    data[5:0],                                    // bits 8-3: char code
-    scanline[2:0]};                               // bits 2-0: row within char
-```
-
-### 3.3 Video Mode Selection (`apple_video.sv:428-436`)
-
-```verilog
-wire [2:0] line_type_w =
-    (videx_mode_r & text_mode_r & an0_r) ? VIDEX_LINE :  // Existing shadow path
-    (!GR & !col80_r) ? TEXT40_LINE :
-    (!GR & col80_r)  ? TEXT80_LINE :                      // Target path
-    ...
-```
-
-### 3.4 Existing Videx Shadow Support (Passive, Not Reused)
-
-The current `VIDEX_LINE` path (`apple_video.sv:613-643`) and Videx VRAM shadow (`apple_memory.sv:175-262`) implement passive monitoring of a real Videx card. This code:
-- Only snoops bus writes (never drives the bus)
-- Uses its own separate VRAM (2 KB sdpram32)
-- Uses its own character ROM (`videx_charrom.hex`)
-- Uses its own rendering pipeline with 9-scanline geometry
-- Requires an external A2DVI v4.4 card in slot 3
-
-**This existing code serves a fundamentally different purpose and is not reused by the proposed approach.** The new emulation replaces the need for an external card entirely.
-
-### 3.5 Virtual Card Infrastructure (`slotmaker.sv`, `slot_if.sv`)
-
-The A2FPGA already has a virtual slot system supporting multiple card types (SuperSprite, Mockingboard, Super Serial Card, Disk II). Each card:
-- Gets a unique 8-bit card ID
-- Implements the `slot_if` interface
-- Receives `dev_select_n` (I/O at $C0n0-$C0nF), `io_select_n` (ROM at $Cn00-$CnFF), `io_strobe_n` ($C800-$CFFF)
-- Can drive data onto the bus in response to reads
-- Is configured via `slots.hex` and the PicoSoC slot manager
+Both paths exist in the synthesized bitstream when `VIDEX_SUPPORT=1`. The question is which one to wire the new emulated card's output to.
 
 ---
 
-## 4. Proposed Architecture: Videx Emulation Card
+## 3. What Both Approaches Share: The Virtual Card Front End
 
-### 4.1 Overview
+Regardless of rendering approach, a new virtual card module (`videx_card.sv`) is needed. This is identical for both approaches:
 
-```
-Apple ][+ Bus
-  └── Slot 3: A2FPGA Virtual Videx Card (new module)
-        ├── Provides Videx firmware ROM ($C300-$C3FF, $C800-$CFFF)
-        ├── Emulates MC6845 CRTC registers ($C0B0-$C0BF)
-        ├── Provides 2 KB VRAM ($CC00-$CDFF) with read/write
-        ├── Translates VRAM content → IIe text_vram (address + char mapping)
-        ├── Forces internal COL80=1 when active
-        └── Existing TEXT80 pipeline renders the output via HDMI
-```
+### 3.1 Card Module (implements `slot_if`)
+- Assigned to slot 3 with a unique card ID
+- Follows the established pattern from `super_serial_card.sv`
+- `card_enable` / `card_sel` / `card_dev_sel` / `card_io_sel` logic
 
-### 4.2 New Module: `videx_card.sv`
+### 3.2 Firmware ROM (active bus response)
+- 256 bytes at $C300-$C3FF (slot ROM, cold-start entry)
+- 2 KB at $C800-$CFFF (expansion ROM, full terminal driver)
+- Drives `data_o` onto bus during CPU reads (same as SSC ROM serving)
+- Videx VideoTerm ROM 2.4 stored as `.hex` in BSRAM
 
-A new virtual card module implementing `slot_if`, assigned to slot 3 with a new card ID (e.g., ID=5). Components:
+### 3.3 MC6845 CRTC Register File
+- 16 registers accessed via index port ($C0B0 even) / data port ($C0B1 odd)
+- Read support: return R14/R15 on reads (cursor position, firmware reads these)
+- R0-R13 write-only (matches real MC6845 behavior)
+- Bank selection: address bits [3:2] select VRAM bank (0-3)
 
-**A. Firmware ROM (read-only, active bus response)**
-- 256 bytes at $C300-$C3FF (slot ROM)
-- 2 KB at $C800-$CFFF (expansion ROM)
-- Source: Videx VideoTerm ROM 2.4 (publicly documented and disassembled)
-- Active bus response required: when the CPU reads these addresses, the card must drive `data_o` onto the bus
-- This is the same pattern used by `super_serial_card.sv` which already serves ROM from BSRAM
+### 3.4 VRAM (2 KB, read/write)
+- 4 banks x 512 bytes at $CC00-$CDFF
+- Must support CPU reads (the shadow mode only captures writes)
+- The existing `sdpram32` pattern already handles the write side
+- Read-back requires either a second read port or time-multiplexed access
 
-**B. MC6845 CRTC Register File (read/write)**
-- 16 registers, accessed via index port ($C0B0) and data port ($C0B1)
-- Writes: latch index on even address, write data on odd address
-- Reads: must return register data on odd address reads (the firmware reads cursor position, etc.)
-- Bank selection: bits [3:2] of the $C0Bx address select the VRAM bank (0-3)
-- Need all 16 registers, though only R9-R15 affect display behavior
+### 3.5 Bus Response Wiring
+- `data_o`, `rd_en_o` signals muxed into the top-level bus multiplexer
+- Same pattern as existing cards: `data_out_w = videx_rd ? videx_d_w : ...`
 
-**C. VRAM (2 KB, read/write)**
-- 4 banks x 512 bytes, accessible at $CC00-$CDFF
-- Must support CPU reads (unlike the shadow mode which only captures writes)
-- Bank selected by the address bits used during CRTC index port access
-- Stored in sdpram32 (512 x 32-bit words), same as existing shadow VRAM
-
-**D. Address Translation Engine (VRAM → text_vram sync)**
-- Converts Videx linear addresses to IIe scrambled text page addresses
-- Handles CRTC R12/R13 display start offset
-- Must write to both main and aux byte positions in `text_vram`
-- Detailed in Section 5
-
-**E. Character Translation (Videx → IIe encoding)**
-- Maps Videx character codes to IIe character codes
-- Detailed in Section 6
-
-**F. Soft Switch Override**
-- When the Videx card is active, forces `COL80=1` internally
-- Also needs to ensure `TEXT_MODE=1` during text display
-- May need to set `AN0=1` as a compatibility signal
+**Estimated effort for the shared front end: ~300-400 lines of SystemVerilog.** This is the same regardless of rendering approach.
 
 ---
 
-## 5. Challenge: Address Translation (Linear → Scrambled)
+## 4. Approach A: Translate to IIe TEXT80 Path
 
-### 5.1 The Problem
+### 4.1 Architecture
 
-The Videx uses linear VRAM addressing:
 ```
-vram_address = (display_start + row * 80 + col) mod 2048
-```
-
-The Apple IIe text page uses the standard Apple II scrambled layout:
-```
-iie_address = $0400 + (row / 8) * 40 + (row % 8) * 128 + col / 2
-bank = col[0]  (0 = aux, 1 = main)
-```
-
-The 24 text rows map to these base addresses:
-
-| Row | Address | Row | Address | Row | Address |
-|-----|---------|-----|---------|-----|---------|
-| 0 | $0400 | 8 | $0428 | 16 | $0450 |
-| 1 | $0480 | 9 | $04A8 | 17 | $04D0 |
-| 2 | $0500 | 10 | $0528 | 18 | $0550 |
-| 3 | $0580 | 11 | $05A8 | 19 | $05D0 |
-| 4 | $0600 | 12 | $0628 | 20 | $0650 |
-| 5 | $0680 | 13 | $06A8 | 21 | $06D0 |
-| 6 | $0700 | 14 | $0728 | 22 | $0750 |
-| 7 | $0780 | 15 | $07A8 | 23 | $07D0 |
-
-### 5.2 Per-Write Translation
-
-When the CPU writes a byte to Videx VRAM at address `A`:
-
-1. Compute position relative to display start:
-   `pos = (A - display_start) mod 2048`
-
-2. If `pos >= 1920` (80 * 24), the character is offscreen — skip.
-
-3. Compute row and column:
-   `row = pos / 80`, `col = pos % 80`
-
-4. Compute IIe text page word address and byte lane:
-   ```
-   iie_base = row_base_table[row]  // 24-entry lookup table
-   iie_addr = iie_base + col / 2
-   byte_lane = col[0]              // 0 → aux (byte 1 or 3), 1 → main (byte 0 or 2)
-   ```
-
-5. Translate the character code (Section 6).
-
-6. Write the translated character to `text_vram` at the computed address and byte lane.
-
-### 5.3 Division by 80
-
-Computing `row = pos / 80` and `col = pos % 80` in hardware requires either:
-- A lookup table (2048 entries → row/col)
-- A multiply-shift approximation: `row = (pos * 13) >> 10` (exact for 0-1919)
-- Iterative subtraction (too slow for single-cycle)
-
-The multiply-shift approach is preferred, matching the existing `videx_div9_w` pattern:
-```verilog
-wire [20:0] div80_product = videx_pos * 11'd13;
-wire [4:0] videx_row = div80_product[20:10];
-wire [6:0] videx_col = videx_pos - videx_row * 7'd80;
+Videx Card (new)           apple_memory           apple_video
+┌──────────────┐          ┌──────────────┐       ┌──────────────┐
+│ Firmware ROM │          │              │       │              │
+│ CRTC Regs    │          │  text_vram   │──────>│  TEXT80_LINE  │───> HDMI
+│ VRAM (2KB)   │─ sync ──>│  (main+aux)  │       │  pipeline    │
+│ Sync Engine  │  engine  │              │       │              │
+│ Char Xlate   │          │              │       │              │
+│ Addr Xlate   │          │              │       │              │
+└──────────────┘          └──────────────┘       └──────────────┘
 ```
 
-### 5.4 The Scroll Problem
+### 4.2 Additional Components Required
 
-When CRTC R12/R13 (display start) changes, the mapping of every VRAM address to screen position changes. A single register write can cause all 1920 characters to need re-translation.
+**A. Address Translation Engine** — Converts Videx linear addresses to IIe scrambled text page addresses:
+- Division by 80 (multiply-shift: `row = (pos * 13) >> 10`)
+- 24-entry row base address lookup table
+- Main/aux byte lane selection from column parity
+- Display start offset (CRTC R12/R13) handling
 
-**Options:**
+**B. Character Encoding Translation** — 256-byte lookup table mapping Videx codes to IIe codes:
+- Videx $00-$7F (normal) → IIe $80-$FF (normal range)
+- Videx $80-$FF (inverse) → IIe $00-$3F (inverse range)
+- **Limitation:** IIe has only 64 inverse glyphs (no inverse lowercase)
+- **Limitation:** Uses IIe font, not Videx font (different glyph designs)
 
-**Option A: Full re-sync on scroll**
-- Maintain a state machine that iterates through all 1920 positions
-- At ~54 MHz clock, this takes ~1920 cycles ≈ 36 microseconds
-- The Videx firmware scrolls by changing R12/R13 and then writing one new line (80 chars)
-- 36 µs is well within the vertical blanking interval (~1.3 ms)
-- **Recommended approach**
+**C. Continuous Background Sync Engine** — Free-running state machine:
+- Iterates through all 1920 screen positions at 54 MHz (~36 µs per full pass)
+- For each position: read Videx VRAM → translate character → translate address → write text_vram
+- Handles scrolling automatically (R12/R13 changes just shift the mapping)
+- Requires write port arbitration with the Apple II bus
 
-**Option B: Continuous background sync**
-- A free-running sync engine that continuously copies VRAM → text_vram
-- Cycles through all 1920 positions, taking ~36 µs per full pass
-- Handles scrolls automatically without special detection
-- Adds slight latency (up to 36 µs) for any VRAM write to appear
-- Simpler logic, no need to detect R12/R13 changes
-- **Alternative approach — simpler but adds imperceptible latency**
+**D. Write Port Arbitration** — Time-multiplexed access to text_vram:
+- Bus writes occur on `phi1_posedge` with `data_in_strobe`
+- Sync engine writes during other clock cycles
+- ~54 FPGA cycles per bus cycle provides ample time
 
-**Option C: Dual-port rendering**
-- Instead of syncing to text_vram, add a mux at the video scanner level
-- When Videx is active, the TEXT80 pipeline reads from Videx VRAM instead of text_vram
-- Requires address translation in the read path (IIe scanner address → Videx linear address)
-- This is the reverse translation: given the IIe scanner's scrambled address, compute the Videx VRAM address
-- Avoids write-side translation entirely but requires modifying the video scanner
-- Partially contradicts the goal of reusing the existing TEXT80 path unmodified
+**E. Soft Switch Override** — Force `COL80=1` when Videx active:
+- Modifies `a2mem_if.COL80` to activate TEXT80 rendering
+- On a ][+, this signal is normally always 0
+
+### 4.3 Visual Compromises
+
+| Issue | Impact |
+|-------|--------|
+| 8 scanlines/char instead of 9 | Characters with descenders (g,j,p,q,y) lose bottom line. Tighter vertical spacing. |
+| IIe font instead of Videx font | Different glyph designs. Not pixel-accurate to real Videx. |
+| No inverse lowercase | IIe ROM lacks inverse lowercase glyphs (64 vs 128 inverse chars) |
+| Smaller active area | 384 px tall vs 432 px (48 px larger borders) |
+
+### 4.4 Resource Cost (beyond shared front end)
+
+| Component | Cost |
+|-----------|------|
+| Char translation LUT | 256 x 8 bits ROM |
+| Row base address LUT | 24 x 10 bits ROM |
+| Division by 80 multiplier | 11-bit x 11-bit |
+| Sync state machine | ~200 flip-flops |
+| Write port mux logic | ~50 LUTs |
+| **Total additional** | **~300 LUTs, 1 multiplier, 0 BSRAM** |
+
+Note: This does NOT save the VIDEX_LINE rendering path or Videx character ROM — those are already synthesized when `VIDEX_SUPPORT=1`. The translation logic is purely **additive**.
 
 ---
 
-## 6. Challenge: Character Encoding Translation
+## 5. Approach B: Build Upon the Videx Shadow Path
 
-### 6.1 The Two Encoding Schemes
+### 5.1 Architecture
 
-**Videx VideoTerm** (mapped through Videx character ROM):
-| Code Range | Display |
-|-----------|---------|
-| $00-$7F | Normal characters (standard ASCII-mapped glyphs) |
-| $80-$FF | Inverse characters (pre-inverted in ROM) |
-
-The Videx firmware writes ASCII-like codes to VRAM. The character ROM maps these directly to pixel patterns.
-
-**Apple IIe** (mapped through IIe character ROM with address encoding logic):
-| Code Range | bits [7:6] | Display |
-|-----------|-----------|---------|
-| $00-$3F | 00 | Inverse (chars @A-Z[\]^_ and space-?) |
-| $40-$7F | 01 | Flash (same chars, blinking) or MouseText if ALTCHAR |
-| $80-$BF | 10 | Normal (same chars, normal display) |
-| $C0-$FF | 11 | Normal (same chars, normal display) |
-
-The IIe ROM address bits 10-9 select the display mode (inverse/flash/normal/alt), while bits 8-3 select the character glyph (6-bit code, 64 unique glyphs).
-
-### 6.2 Translation Table
-
-To display a Videx character correctly through the IIe rendering path, each Videx code must be mapped to the IIe code that produces the same visual output.
-
-For **normal** Videx characters ($00-$7F):
-- Videx $00-$1F (control chars/symbols) → IIe $80-$9F (normal, low range)
-- Videx $20-$3F (space, digits, punctuation) → IIe $A0-$BF (normal, high range)
-- Videx $40-$5F (uppercase letters, @[\]^_) → IIe $C0-$DF (normal)
-- Videx $60-$7F (lowercase letters, {|}~) → IIe $E0-$FF (normal) **if alternate charset supports lowercase, otherwise approximation needed**
-
-For **inverse** Videx characters ($80-$FF):
-- Videx $80-$9F → IIe $00-$1F (inverse)
-- Videx $A0-$BF → IIe $20-$3F (inverse)
-- Videx $C0-$DF → IIe $00-$1F (inverse, limited to 64 unique inverse glyphs)
-- Videx $E0-$FF → IIe $20-$3F (inverse)
-
-### 6.3 Lowercase Character Problem
-
-The standard Apple IIe character ROM has lowercase support in the normal character range ($E0-$FF), but the **inverse** range only has 64 glyphs ($00-$3F → glyphs for @A-Z[\]^_ and space through ?). There are no inverse lowercase glyphs in the standard IIe ROM.
-
-The Videx has inverse lowercase because its ROM contains pre-inverted versions of all 128 characters.
-
-**Options:**
-1. **Accept the limitation**: Inverse lowercase characters display as inverse uppercase (minor visual difference, rarely used)
-2. **Custom character ROM**: Modify `video.hex` to include inverse lowercase glyphs in unused ROM regions
-3. **Use ALTCHAR mode**: The IIe alternate character set replaces flash characters ($40-$7F) with MouseText, which doesn't help with inverse lowercase
-
-**Recommendation:** Option 1 for initial implementation. Inverse lowercase is rare in practice (most Videx software uses normal text with an inverse cursor).
-
-### 6.4 Character ROM Compatibility
-
-The Videx and IIe use **different character ROMs** with different glyph designs. The Videx ROM has taller characters (9 scanlines vs 8) and its own distinctive font. When rendering through the IIe TEXT80 path, characters will use the IIe font, not the Videx font. This is an acceptable trade-off since the goal is functional 80-column emulation, not pixel-exact Videx reproduction.
-
-If pixel-exact Videx appearance is desired, the IIe character ROM (`video.hex`) could be replaced or augmented with Videx-style glyphs, but this affects all IIe text display.
-
----
-
-## 7. Challenge: 9 vs 8 Scanlines Per Character
-
-### 7.1 The Difference
-
-| Parameter | Videx | IIe TEXT80 |
-|-----------|-------|-----------|
-| Scanlines/char | 9 (lines 0-8) | 8 (lines 0-7) |
-| Active lines | 216 (24 x 9) | 192 (24 x 8) |
-| Doubled height | 432 px | 384 px |
-| V border | 24 px each side | 48 px each side |
-
-The IIe TEXT80 path hardcodes `window_y_w[2:0]` (3 bits, values 0-7) as the scanline within each character. The Videx uses 4-bit scanline values 0-8.
-
-### 7.2 Impact
-
-Using the IIe TEXT80 path as-is means each character row is 8 scanlines (16 doubled pixels) instead of 9 scanlines (18 doubled pixels). For most characters, scanline 8 is blank (descender space), so the visual difference is:
-- Slightly more compact vertical spacing
-- Characters with descenders (g, j, p, q, y) lose their lowest descender line
-- Total active area: 384 px instead of 432 px (48 px difference, larger borders)
-
-### 7.3 Options
-
-**Option A: Accept 8-scanline rendering (recommended for initial implementation)**
-- No changes to the TEXT80 rendering path
-- Minor visual difference — most users won't notice
-- Simplest implementation
-
-**Option B: Modify TEXT80 to support 9-scanline mode**
-- Add a `videx_active` signal that switches the TEXT80 path to 9-scanline geometry
-- Change `window_y_w` calculation to use division by 9 instead of shift by 3
-- Change vertical borders from 48 to 24 px
-- Adds complexity to the shared rendering path
-- Could be controlled by a parameter or runtime flag
-
-**Option C: Keep the VIDEX_LINE rendering path for display, but feed it from text_vram**
-- Use the existing 9-scanline Videx rendering geometry
-- But read data from text_vram instead of Videx VRAM
-- Requires reverse address translation in the read path
-- Partially defeats the purpose of using the IIe path
-
----
-
-## 8. Challenge: Write Port Contention on `text_vram`
-
-### 8.1 The Problem
-
-The existing `text_vram` has a single write port driven by the Apple II bus:
-```verilog
-sdpram32 #(.ADDR_WIDTH(10)) text_vram (
-    .write_addr(text_write_offset[11:2]),
-    .write_data(write_word),
-    .write_enable(write_strobe && bus_addr_0400_0BFF),
-    .byte_enable(4'(1 << text_write_offset[1:0])),
-    .read_addr(text_read_offset),
-    .read_enable(1'b1),
-    .read_data(text_data)
-);
+```
+Videx Card (new)           apple_memory           apple_video
+┌──────────────┐          ┌──────────────┐       ┌──────────────┐
+│ Firmware ROM │          │              │       │              │
+│ CRTC Regs ───────────────> a2mem_if.*  │──────>│  VIDEX_LINE   │───> HDMI
+│ VRAM (2KB) ──────────────> videx_vram  │──────>│  pipeline    │
+│              │          │              │       │              │
+└──────────────┘          └──────────────┘       └──────────────┘
 ```
 
-The Videx translation engine also needs to write to `text_vram`. Two writers to one write port requires arbitration.
+### 5.2 What Already Works (No Changes Needed)
 
-### 8.2 Options
+The existing Videx shadow code in `apple_memory.sv` and `apple_video.sv` already provides:
 
-**Option A: Time-multiplexed write port**
-- The Apple II bus writes occur on `phi1_posedge` with `data_in_strobe`
-- The Videx sync engine writes during the other half of the clock cycle
-- At 54 MHz, there are many clock cycles between bus transactions (~54 cycles per 1 MHz bus cycle)
-- Write port can be muxed between bus writes and Videx sync writes
-- **Recommended approach**
+| Component | Status | Location |
+|-----------|--------|----------|
+| CRTC register storage (R9-R15) | Working | `apple_memory.sv:183-220` |
+| VRAM write capture (2 KB sdpram32) | Working | `apple_memory.sv:229-247` |
+| VRAM bank selection (4 x 512B) | Working | `apple_memory.sv:199-200` |
+| VIDEX_MODE detection flag | Working | `apple_memory.sv:188,204` |
+| 9-scanline character geometry | Working | `apple_video.sv:82-87,172-188` |
+| Division by 9 (row/scanline calc) | Working | `apple_video.sv:182-187` |
+| Row x 80 linear address calc | Working | `apple_video.sv:461-466` |
+| Hardware scroll (R12/R13 base) | Working | `apple_video.sv:173,464` |
+| Videx character ROM (4 KB) | Working | `apple_video.sv:209-216` |
+| Full rendering pipeline (stages 0-5) | Working | `apple_video.sv:613-643` |
+| MC6845 cursor with blink modes | Working | `apple_video.sv:468-491` |
+| Frame counter for blink timing | Working | `apple_video.sv:476-482` |
 
-**Option B: Replace text_vram with true dual-port RAM**
-- Some FPGA architectures support dual-port BSRAM
-- Adds a second independent write port for the Videx engine
-- More resource-intensive, may not be available on all target FPGAs (Gowin GW2A)
+### 5.3 What Needs to Change
 
-**Option C: Intercept at the bus write level**
-- Instead of the Videx card writing to its own VRAM and then syncing, have it directly translate the write address on the fly and write to text_vram as if it were a bus write to $0400-$0BFF
-- The Videx card modifies the address/data/E1 signals before they reach text_vram
-- Fastest (single-cycle per write) but doesn't handle scrolling
+The shadow implementation is **passive** — it only snoops bus writes. For active emulation, these changes are needed:
+
+**A. CRTC register source:** Currently, the CRTC register capture logic in `apple_memory.sv:190-211` snoops writes to $C0Bx from an external card. For the emulated card, the registers are managed by the new `videx_card.sv` module instead. The card writes them to `a2mem_if.VIDEX_CRTC_R*` signals directly, or the existing capture logic picks up the card's bus responses (since the card *is* responding on the bus, the snoop logic still sees the writes).
+
+**B. VRAM write source:** Same situation — the CPU writes to $CC00-$CDFF, the card responds (handling bank selection), and the existing VRAM capture logic in `apple_memory.sv:229-247` still snoops those writes into `videx_vram`. The card and the shadow see the same bus transactions.
+
+**C. VRAM read-back:** The shadow `sdpram32` has its read port dedicated to the video scanner. CPU read-back requires either:
+- A time-multiplexed read port (read during non-scan cycles)
+- A separate small read buffer in the card module
+- Or the card maintains its own parallel VRAM copy for reads (adds 2 KB BSRAM)
+
+**D. VIDEX_MODE activation:** Currently set by detecting the first CRTC write. For emulation, could be set explicitly by the card module when it initializes. The existing mechanism works as-is since the Videx firmware's CRTC writes trigger it.
+
+**E. AN0 handling:** The `VIDEX_LINE` mode selection requires `an0_r` to be set (`apple_video.sv:429`). On a real Videx system, the firmware sets AN0 via the annunciator soft switches. The emulated Videx firmware will do the same thing through normal bus access to $C058/$C059.
+
+### 5.4 Visual Fidelity
+
+| Aspect | Result |
+|--------|--------|
+| 9-scanline characters | Native — full descender support |
+| Videx character ROM | Native — correct Videx font |
+| Full inverse character set | Native — 128 normal + 128 inverse via pre-inverted ROM |
+| 432 px active area | Native — correct vertical geometry |
+| Hardware scrolling | Native — R12/R13 directly drive rendering address |
+| Cursor blink modes | Native — all 4 MC6845 blink modes supported |
+
+**No visual compromises.**
+
+### 5.5 Resource Cost (beyond shared front end)
+
+| Component | Cost |
+|-----------|------|
+| VRAM read-back path | ~30 LUTs (mux or buffer) |
+| **Total additional** | **~30 LUTs, 0 multipliers, 0 BSRAM** |
+
+Everything else already exists in the shadow implementation.
 
 ---
 
-## 9. Challenge: Active Bus Response
+## 6. Head-to-Head Comparison
 
-### 9.1 Current Virtual Card Bus Driving
+### 6.1 Space
 
-The existing virtual cards (SuperSprite, Mockingboard, Super Serial) already drive data onto the bus for reads. The pattern from `super_serial_card.sv`:
+| | Approach A (TEXT80) | Approach B (VIDEX_LINE) |
+|--|---------------------|------------------------|
+| Firmware ROM | 2 KB BSRAM | 2 KB BSRAM |
+| CRTC registers | 128 FFs | 128 FFs |
+| Card VRAM | 2 KB BSRAM | (reuses existing shadow VRAM) |
+| Char translation LUT | 256 bytes | **Not needed** |
+| Row base address LUT | 240 bits | **Not needed** |
+| Sync state machine | ~200 FFs + ~300 LUTs | **Not needed** |
+| Write port mux | ~50 LUTs | **Not needed** |
+| Div-by-80 multiplier | 1 multiplier | **Not needed** |
+| VRAM read-back | (text_vram already readable) | ~30 LUTs |
+| Videx char ROM (4 KB) | Still synthesized (VIDEX_SUPPORT=1) | Already present |
+| VIDEX_LINE stages | Still synthesized (VIDEX_SUPPORT=1) | Already present |
+| **Net additional logic** | **~550 LUTs + 1 mult** | **~30 LUTs** |
 
-```verilog
-assign a2bus_if.data = (rd_en) ? data_o : 8'bZ;
-```
+**Winner: Approach B.** Approach A adds translation logic but does NOT eliminate the Videx rendering path (it's still in the bitstream). Approach B reuses what's already there with minimal additions.
 
-The Videx card needs the same capability for:
-- Slot ROM reads ($C300-$C3FF)
-- Expansion ROM reads ($C800-$CFFF)
-- CRTC register reads ($C0B1)
-- VRAM reads ($CC00-$CDFF)
+If `VIDEX_SUPPORT=0` (Videx path stripped), Approach A avoids ~4 KB BSRAM (Videx char ROM + VRAM) but adds ~550 LUTs + 1 multiplier + its own 2 KB VRAM. This is not a meaningful savings — and loses visual fidelity.
 
-### 9.2 Firmware ROM Source
+### 6.2 Performance
 
-The Videx VideoTerm ROM 2.4 is required. It is a 2 KB firmware image containing:
-- $C300-$C3FF: 256-byte slot ROM (identification and cold-start entry)
-- $C800-$CFFF: 2048-byte expansion ROM (full terminal driver)
+| | Approach A (TEXT80) | Approach B (VIDEX_LINE) |
+|--|---------------------|------------------------|
+| Character write latency | Up to 36 µs (sync engine cycle) | **0 cycles** (direct VRAM write → immediate render) |
+| Scroll latency | Up to 36 µs | **0 cycles** (R12/R13 change takes effect next frame) |
+| Write port contention | Arbitration needed (bus vs sync) | **None** (separate VRAM, no contention) |
+| Rendering accuracy | 8-scanline approximation | **Exact 9-scanline rendering** |
 
-The ROM patches into the Apple II's character output routine (COUT at $FDED) via the slot 3 entry point, providing:
-- Terminal emulation (cursor movement, scrolling, clear screen)
-- CRTC initialization
-- Character output to VRAM
-- Keyboard input handling
+**Winner: Approach B.** Zero translation latency, zero scroll latency, zero contention.
 
-The firmware is publicly documented and available from historical archives. It would be stored as a `.hex` file and loaded into BSRAM, similar to the existing `cardrom.hex`.
+### 6.3 Maintenance
 
-### 9.3 CRTC Register Read-Back
+| | Approach A (TEXT80) | Approach B (VIDEX_LINE) |
+|--|---------------------|------------------------|
+| Conceptual complexity | High — bridges two different display models | Low — single Videx-native model |
+| Cross-module coupling | Card → sync engine → text_vram → TEXT80 pipeline | Card → a2mem_if → VIDEX_LINE pipeline |
+| Bug surface area | Address translation, char translation, sync timing, write arbitration | VRAM read-back mux |
+| Impact of TEXT80 changes | Could break Videx emulation | **No impact** (independent path) |
+| Impact of VIDEX_LINE changes | No impact | Could affect emulation (but same team maintains both) |
+| Code to write | ~400 lines (card) + ~300 lines (translation) | ~400 lines (card) + ~30 lines (read-back) |
+| Code to debug | Translation correctness for 1920 positions × 256 chars | Standard bus response logic |
 
-The Videx firmware reads CRTC registers (notably R14/R15 for cursor position). The MC6845 only allows reads of R14 and R15 (cursor address). Registers R0-R13 are write-only on the real MC6845. The emulation should:
-- Return stored values for R14 and R15 on reads
-- Return $00 or don't-care for R0-R13 reads (write-only on real hardware)
+**Winner: Approach B.** Self-contained, minimal coupling, dramatically less new code.
+
+### 6.4 Summary Table
+
+| Criterion | Approach A (TEXT80) | Approach B (VIDEX_LINE) |
+|-----------|:-------------------:|:-----------------------:|
+| Additional LUTs | ~550 | ~30 |
+| Additional BSRAM | 0 (but doesn't eliminate Videx BSRAM) | 0 |
+| Write latency | Up to 36 µs | 0 |
+| Scroll latency | Up to 36 µs | 0 |
+| Character fidelity | 8-scanline, IIe font, 64 inverse glyphs | 9-scanline, Videx font, 128 inverse glyphs |
+| New code | ~700 lines | ~430 lines |
+| Bug surface area | Large (4 translation subsystems) | Small (bus response only) |
+| Cross-module coupling | High | Low |
 
 ---
 
-## 10. Implementation Plan
+## 7. Recommendation
 
-### Phase 1: Virtual Card Shell
+**Build upon the existing Videx shadow implementation (Approach B).**
+
+The `VIDEX_LINE` rendering path already solves the hard problems — 9-scanline geometry, hardware scrolling, cursor blinking, linear VRAM addressing, and Videx character ROM lookup. It was designed to faithfully reproduce Videx video output and it does so. The only thing missing is an active card module to drive the bus side.
+
+Approach A (TEXT80 mapping) adds significant complexity to bridge two fundamentally different display models — scrambled vs. linear addressing, different character encodings, different scanline counts, different character ROMs — and the result is still a visual approximation. Meanwhile, the rendering infrastructure it tries to reuse (TEXT80) is dead code on a ][/][+ anyway, while the infrastructure it tries to avoid (VIDEX_LINE) is already synthesized and working.
+
+The Videx shadow path was built to render Videx output faithfully. Promoting it from "passive shadow" to "active emulation" is the natural evolution.
+
+---
+
+## 8. Implementation Plan (Approach B)
+
+### Phase 1: Virtual Card Module
 1. Create `hdl/videx/videx_card.sv` implementing `slot_if`
-2. Add card ID (e.g., ID=5) to the slot system
+2. Add card ID to the slot system (e.g., ID=5)
 3. Implement firmware ROM serving ($C300-$C3FF, $C800-$CFFF)
-4. Implement basic CRTC register file (write index/data, read R14/R15)
-5. Implement VRAM read/write with bank selection
-6. Wire into board top-level (initially a2n20v2 only)
+4. Implement CRTC register file with read-back (R14/R15)
+5. Implement VRAM bank selection and write handling
+6. Implement VRAM CPU read-back (time-multiplexed or buffered)
 
-### Phase 2: VRAM-to-TextRAM Translation Engine
-1. Implement character encoding translation (256-entry lookup table)
-2. Implement address translation (Videx linear → IIe scrambled + bank)
-3. Implement per-write sync: on each VRAM write, compute the IIe address and write to text_vram
-4. Implement write port arbitration (time-multiplexed)
-5. Force COL80=1 when Videx card is active
+### Phase 2: Integration
+1. Wire card into board top-level (`top.sv`) with `data_o`/`rd_en_o`
+2. Add to bus data multiplexer alongside existing cards
+3. Verify the existing CRTC capture and VRAM shadow logic works with the card's bus responses
+4. Ensure `VIDEX_MODE` activates correctly from the card's CRTC initialization
+5. Verify AN0 is set by the Videx firmware through normal annunciator access
 
-### Phase 3: Scroll Handling
-1. Detect CRTC R12/R13 changes
-2. Implement full-screen re-sync state machine (iterate 1920 positions)
-3. Optimize: only re-sync during vertical blanking to avoid visual tearing
-
-### Phase 4: Testing and Refinement
-1. Test with Videx-aware software (Apple Writer II, WordStar, etc.)
-2. Verify cursor behavior
+### Phase 3: Testing
+1. Test with Videx firmware initialization (CRTC setup, VRAM clear)
+2. Test character output (Apple Writer II, WordStar, CP/M)
 3. Test hardware scrolling
-4. Validate character display accuracy
+4. Test cursor positioning and blink modes
 5. Test on actual Apple ][+ hardware
 
-### Phase 5: Optional Enhancements
-1. 9-scanline character support (modified TEXT80 geometry)
-2. Multiple character set support (Videx supported up to 11 sets)
-3. Videx-style character ROM option
-4. Support for other Videx-compatible cards (Wesper, Vision-80, etc.)
+### Phase 4: Refinements
+1. Handle edge cases in VRAM read-back timing
+2. Support for Videx-compatible software that directly manipulates CRTC/VRAM
+3. Optional: multiple character set support (Videx supported up to 11 sets)
 
 ---
 
-## 11. Resource Estimates
+## 9. Detailed Analysis: What Changes for Each Module
 
-| Resource | Size | Notes |
-|----------|------|-------|
-| Firmware ROM | 2 KB BSRAM | Videx VideoTerm ROM 2.4 |
-| CRTC registers | 16 x 8 bits | Flip-flops (128 bits) |
-| VRAM | 2 KB BSRAM | 512 x 32-bit sdpram32 (reuse existing pattern) |
-| Character translation LUT | 256 x 8 bits | Distributed RAM or ROM |
-| Row base address LUT | 24 x 10 bits | IIe text page row addresses |
-| Sync state machine | ~200 FFs | Address translation + arbitration |
-| Division by 80 | 1 multiplier | 11-bit x 11-bit → 21-bit |
+### 9.1 New: `hdl/videx/videx_card.sv` (~400 lines)
 
-Total additional BSRAM: ~4 KB (ROM + VRAM). This is modest given the A2N20v2 has 41 x 18Kbit BSRAM blocks.
+```
+Module ports:
+  a2bus_if.slave     — Bus signals (addr, data, rw_n, phi1, etc.)
+  a2mem_if.slave     — Memory interface (to set VIDEX_MODE, CRTC regs)
+  slot_if.card       — Slot interface (dev_select_n, io_select_n, io_strobe_n)
+  output [7:0] data_o     — Data to drive on bus
+  output rd_en_o          — Read enable
+  output irq_n_o          — Interrupt (active low, directly active)
 
----
+Internal components:
+  - Firmware ROM (2 KB BSRAM, loaded from videx_rom.hex)
+  - CRTC register file (16 x 8-bit registers)
+  - CRTC index register (5 bits)
+  - VRAM bank offset (11 bits)
+  - Bus response mux (ROM / CRTC / VRAM read selection)
+```
 
-## 12. Open Questions and Risks
+### 9.2 Modified: `apple_memory.sv`
 
-### 12.1 Firmware ROM Licensing
-The Videx VideoTerm ROM is copyrighted software from the 1980s. Distribution as part of the FPGA bitstream may have legal implications. Options:
-- User provides their own ROM dump (loaded at configuration time)
-- Use a compatible open-source terminal firmware
-- Investigate if the ROM is considered abandonware
+The existing `videx_gen` generate block (lines 175-262) may need minor adjustments:
+- The CRTC capture logic already snoops $C0Bx writes — this continues to work because the CPU's writes to $C0Bx are still visible on the bus even when the card is responding
+- The VRAM capture logic already snoops $CC00-$CDFF writes — same principle
+- **Possible change:** The VRAM read port is currently dedicated to the video scanner. If CPU read-back is needed from this same VRAM (rather than a separate copy in the card), a read-port mux would be added here
+- **Possible change:** Allow `VIDEX_MODE` to be set by the card module directly (belt and suspenders alongside the automatic detection)
 
-### 12.2 Apple ][+ Bus Signal Differences
-The Apple ][+ lacks the `m2sel_n` and `m2b0` signals present on the IIe bus. The current soft switch decoding in `apple_memory.sv` uses `!a2bus_if.m2sel_n` as a condition. On an Apple ][+:
-- `m2sel_n` should be tied low (always selected) or the condition removed for ][+ mode
-- `m2b0` should be tied low (no bank switching)
-- The A2FPGA bus interface may already handle this, but needs verification
+### 9.3 Unchanged: `apple_video.sv`
 
-### 12.3 Slot 3 Conflicts
-On the Apple IIe, slot 3 is special (SLOTC3ROM controls internal vs external ROM). On the Apple ][+, slot 3 is a normal expansion slot. The virtual Videx card must ensure:
-- INTCXROM is not set (would block slot ROM access)
-- The slot 3 ROM is accessible without IIe-specific enable logic
+No changes needed. The `VIDEX_LINE` rendering path, all geometry calculations, cursor logic, and character ROM lookup work as-is. The video module reads from `videx_vram_data_i` and `a2mem_if.VIDEX_CRTC_R*` — both are populated by the shadow capture logic which continues to function.
 
-### 12.4 Write Port Timing
-The time-multiplexed write approach for text_vram requires careful timing analysis to ensure the Videx sync engine's writes don't collide with bus-originated writes. At 54 MHz with a 1 MHz bus, there are ~54 FPGA clock cycles per bus cycle, providing ample time.
+### 9.4 Modified: Board `top.sv`
 
-### 12.5 Software Compatibility
-Some Videx software directly accesses the MC6845 registers or VRAM in non-standard ways. The emulation should handle:
-- Direct VRAM manipulation (programs that write to $CC00-$CDFF without using firmware)
-- Custom CRTC timing (programs that change R0-R8 for non-standard display modes)
-- Bank switching between the 4 VRAM banks
-
-### 12.6 Interaction with Existing Shadow Mode
-The existing `VIDEX_SUPPORT` passive monitoring and the new active emulation are mutually exclusive. When the virtual Videx card is active, the shadow monitoring path should be disabled to avoid conflicts. This can be controlled via the card enable/disable mechanism.
+- Instantiate `videx_card` module alongside existing cards
+- Add to bus data multiplexer: `data_out_w = videx_rd ? videx_d_w : ...`
+- Add `rd_en_o` to `data_out_en_w` OR chain
+- Wire `slot_if` from `slotmaker` to the new card
+- Connect Videx VRAM read port (if read-back is routed through `apple_memory`)
 
 ---
 
-## 13. Comparison of Approaches
+## 10. Open Questions
 
-| Approach | Complexity | Visual Fidelity | TEXT80 Reuse | Scroll Handling |
-|----------|-----------|----------------|-------------|-----------------|
-| **A: Full VRAM→text_vram sync** | Medium-High | Good (8-scanline) | Complete | Re-sync engine needed |
-| **B: Continuous background sync** | Medium | Good (8-scanline) | Complete | Automatic |
-| **C: Read-path mux (render from Videx VRAM)** | Medium | Excellent (9-scanline possible) | Partial | Not needed |
-| **D: Hybrid (sync + modified TEXT80)** | High | Excellent | Mostly | Re-sync + geometry change |
+### 10.1 Firmware ROM Source
+The Videx VideoTerm ROM is copyrighted. Options:
+- User provides their own ROM dump (loaded via `.hex` file)
+- Open-source terminal firmware (would need to be written)
+- Investigate abandonware/fair-use status
 
-**Recommendation:** Start with Approach B (continuous background sync) for simplicity. The sync engine free-runs at 54 MHz, completing a full pass every ~36 µs. This handles scrolling automatically with imperceptible latency. If the latency proves problematic (unlikely), upgrade to Approach A with explicit scroll detection.
+### 10.2 VRAM Read-Back Architecture
+The shadow `sdpram32` read port is used by the video scanner. For CPU reads of $CC00-$CDFF, options:
+- **Option A:** Card maintains its own copy of VRAM for reads (adds 2 KB BSRAM, simplest)
+- **Option B:** Time-multiplex the shadow VRAM read port between scanner and CPU (requires careful timing)
+- **Option C:** Replace `sdpram32` with true dual-port RAM (if FPGA supports it)
+- **Recommendation:** Option A is simplest. 2 KB BSRAM is cheap on the target FPGAs.
+
+### 10.3 Interaction Between Shadow and Emulation
+When the emulated card is active, the existing shadow capture logic still runs (it snoops the same bus transactions the card generates). This is actually beneficial — the shadow populates the same VRAM and CRTC registers that the VIDEX_LINE renderer reads. No conflict exists because the shadow and the card agree on the bus state.
+
+However, if both an external Videx card AND the emulated card were active simultaneously (shouldn't happen, but defensive design), there would be bus contention. The card should only be enabled on ][/][+ systems, or when explicitly configured.
+
+### 10.4 Apple ][+ Bus Signal Handling
+The `m2sel_n` signal used in slot decode (`apple_memory.sv:197`, `slotmaker.sv`) is an IIe signal. On a ][/][+:
+- Verify the A2FPGA bus interface drives `m2sel_n` correctly for ][+ (should be active/low for all I/O access)
+- The slot decode logic in `slotmaker.sv` uses `!a2bus_if.m2sel_n` as a guard — this must pass on a ][+
 
 ---
 
-## 14. Summary
+## 11. Resource Summary (Approach B)
 
-Emulating a Videx VideoTerm on an Apple ][+ using the existing IIe 80-column path is feasible and architecturally sound. The main components are:
+| Resource | Existing (shadow) | New (card) | Total |
+|----------|-------------------|------------|-------|
+| Firmware ROM | — | 2 KB BSRAM | 2 KB |
+| CRTC register file | 128 FFs (in shadow) | Duplicated or shared | 128 FFs |
+| VRAM (scanner-facing) | 2 KB BSRAM (shadow) | — | 2 KB |
+| VRAM (CPU read-back) | — | 2 KB BSRAM (if Option A) | 2 KB |
+| Videx character ROM | 4 KB BSRAM (shadow) | — | 4 KB |
+| Bus response logic | — | ~200 LUTs | ~200 LUTs |
+| VIDEX_LINE pipeline | Existing | — | Existing |
+| **Total new** | | **2-4 KB BSRAM + ~200 LUTs** | |
 
-1. **New virtual card** (`videx_card.sv`) — medium effort, follows existing card patterns
-2. **Firmware ROM** — needs sourcing/licensing, straightforward to integrate
-3. **VRAM with read/write** — straightforward, matches existing sdpram32 usage
-4. **Address translation** — moderate complexity, well-defined math
-5. **Character translation** — 256-byte lookup table, straightforward
-6. **Sync engine** — the key new component, handles VRAM → text_vram mapping
-7. **Write port arbitration** — standard time-multiplexing
-8. **COL80 override** — minor wiring change in apple_memory.sv
-
-The 9-vs-8 scanline difference is the primary visual compromise. The character ROM difference (IIe font vs Videx font) is secondary. Both can be addressed in later phases if needed.
+This is comparable to the Super Serial Card's resource footprint and well within the capacity of all target FPGAs.
