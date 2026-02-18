@@ -2044,7 +2044,7 @@ Scanline  Hex   Binary     Pixels
   9-15    $00   (padding)
 ```
 
-**Normal space (VRAM `$20`, ROM `$200–$20F`)**: All 16 bytes are `$00` (blank).
+**Normal space (VRAM `$20`, ROM `$200–$20F`)**: Scanline 0 = `$10` (see Section 21.6.1), scanlines 1–15 are `$00`.
 
 **Inverse NUL (VRAM `$80`, ROM `$800–$80F`)**: Scanlines 0–8 are `$FF` (fully lit block), scanlines 9–15 are `$FF`.
 
@@ -2080,3 +2080,39 @@ Example: Inverse 'A' ($41 with inverse flag)
   rom_addr = $C1 * 16 + scanline = $C10 + scanline
   scanline 0: rom[$C10] = $E7 → pixels = ###..###  (inverted)
 ```
+
+### 21.6 Notable Character ROM Anomalies and Features
+
+Analysis of the full `videx_charrom.hex` character ROM reveals several non-obvious properties:
+
+#### 21.6.1 Space Character Anomaly
+
+Character `$20` (space) has scanline 0 = `$10` (a single lit pixel at bit 4) instead of the expected `$00`. All other scanlines are `$00`. This appears to be an artifact of the original Videx font data preserved from the hardware character ROM. It does not affect rendering in practice because the pixel is in the normally-unused bit 7 region, but implementations that check for "blank" characters by testing all scanlines against zero will not match space.
+
+#### 21.6.2 Control Code Characters (`$00`–`$1F`)
+
+These character positions are **not blank** — they contain graphical symbols used for semigraphics and box drawing:
+
+| Range | Content | Encoding |
+|-------|---------|----------|
+| `$00`–`$07` | Block elements | 3-bit encoding of top/middle/bottom thirds (like teletext semigraphics). Each bit controls one third of the character cell. |
+| `$08`–`$0F` | Special composite characters | Possibly fractions, ligatures, or other special symbols |
+| `$10`–`$1F` | Box-drawing characters | Corners, T-junctions, crossroads, and line segments for constructing bordered regions |
+
+These glyphs are accessible only through direct VRAM writes (the firmware's control code dispatcher intercepts codes `$00`–`$1F` before they reach the character encoder). Software that writes directly to VRAM can display these symbols.
+
+#### 21.6.3 Slashed Zero
+
+Digit `0` (character `$30`) has a DEC-style diagonal slash through the center oval to distinguish it from the letter `O` (`$4F`). This is characteristic of the Videx font and differs from the standard Apple II character ROM which uses an unslashed zero.
+
+#### 21.6.4 DEL Character (`$7F`)
+
+Character `$7F` (DEL) is **not blank** — it contains a checkerboard/hatched fill pattern. This follows the convention of several 1980s terminal character ROMs where DEL serves as a visual "rubout" indicator.
+
+#### 21.6.5 True Lowercase Descenders
+
+Lowercase letters with descenders (`g`, `j`, `p`, `q`, `y`) use all 9 displayed scanlines (scanlines 0–8, matching R9 = 8). The descender strokes extend into scanlines 7 and 8, which are the bottom two lines of the 9-scanline character cell. This is a key visual advantage of the Videx's 9-scanline geometry over the Apple IIe's 8-scanline characters, where descenders must be compressed or truncated.
+
+#### 21.6.6 Inverse Half Verification
+
+The inverse character half (VRAM `$80`–`$FF`, ROM `$800`–`$FFF`) is a perfect bitwise NOT of the normal half (VRAM `$00`–`$7F`, ROM `$000`–`$7FF`) across all 8 bits of every displayed scanline. This confirms the character ROM was generated programmatically from a single source font, with the inverse half computed by bit inversion rather than independently designed.
