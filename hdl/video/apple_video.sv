@@ -204,11 +204,12 @@ module apple_video #(
     always @(posedge a2bus_if.clk_pixel) viderom_d_r <= ~viderom_r[viderom_a_r];
 
     // Videx character ROM — only instantiated when VIDEX_SUPPORT is enabled (saves ~150 SSRAM units)
-    reg [11:0] videxrom_a_r;
+    // Half-size ROM: 128 chars × 16 scanlines = 2 KB (1 BSRAM block instead of 2)
+    // Chars 0x80-0xFF are bitwise inverse of 0x00-0x7F, generated in logic at capture
+    reg [10:0] videxrom_a_r;
     reg [7:0] videxrom_d_r;
     generate if (VIDEX_SUPPORT) begin : videx_rom_gen
-        // 256 characters × 16 bytes/char: chars 0x00-0x7F = normal, 0x80-0xFF = inverse (pre-inverted)
-        reg [7:0] videxrom_r[4095:0];
+        reg [7:0] videxrom_r[2047:0];
         initial $readmemh("videx_charrom.hex", videxrom_r, 0);
         always @(posedge a2bus_if.clk_pixel) videxrom_d_r <= videxrom_r[videxrom_a_r];
     end else begin : no_videx_rom_gen
@@ -611,35 +612,37 @@ module apple_video #(
                     pix_buffer_r[20:14] <= viderom_d_r[6:0];
                 end
                 // Videx 80-col pipeline: 4 chars × 7 pixels = 28 pixels per cycle
+                // ROM is half-size (128 chars): addr uses char[6:0], inverse via XOR of char[7]
                 // Stage 0: Issue ROM lookup for char 0
                 STAGE_VIDEX_0: begin
-                    videxrom_a_r <= {videx_data_r[7:0], videx_scanline_w};
+                    videxrom_a_r <= {videx_data_r[6:0], videx_scanline_w};
                 end
                 // Stage 1: Issue ROM lookup for char 1
                 STAGE_VIDEX_1: begin
-                    videxrom_a_r <= {videx_data_r[15:8], videx_scanline_w};
+                    videxrom_a_r <= {videx_data_r[14:8], videx_scanline_w};
                 end
                 // Stage 2: Capture char 0 pixels, issue ROM lookup for char 2
+                // XOR combines char inverse (bit 7) and cursor inversion
                 STAGE_VIDEX_2: begin
-                    pix_buffer_r[6:0] <= (videx_cursor_active_w && videx_cursor_byte_w == 2'd0) ?
-                        videxrom_d_r[6:0] ^ 7'h7F : videxrom_d_r[6:0];
-                    videxrom_a_r <= {videx_data_r[23:16], videx_scanline_w};
+                    pix_buffer_r[6:0] <= videxrom_d_r[6:0] ^
+                        {7{videx_data_r[7] ^ (videx_cursor_active_w && videx_cursor_byte_w == 2'd0)}};
+                    videxrom_a_r <= {videx_data_r[22:16], videx_scanline_w};
                 end
                 // Stage 3: Capture char 1 pixels, issue ROM lookup for char 3
                 STAGE_VIDEX_3: begin
-                    pix_buffer_r[13:7] <= (videx_cursor_active_w && videx_cursor_byte_w == 2'd1) ?
-                        videxrom_d_r[6:0] ^ 7'h7F : videxrom_d_r[6:0];
-                    videxrom_a_r <= {videx_data_r[31:24], videx_scanline_w};
+                    pix_buffer_r[13:7] <= videxrom_d_r[6:0] ^
+                        {7{videx_data_r[15] ^ (videx_cursor_active_w && videx_cursor_byte_w == 2'd1)}};
+                    videxrom_a_r <= {videx_data_r[30:24], videx_scanline_w};
                 end
                 // Stage 4: Capture char 2 pixels
                 STAGE_VIDEX_4: begin
-                    pix_buffer_r[20:14] <= (videx_cursor_active_w && videx_cursor_byte_w == 2'd2) ?
-                        videxrom_d_r[6:0] ^ 7'h7F : videxrom_d_r[6:0];
+                    pix_buffer_r[20:14] <= videxrom_d_r[6:0] ^
+                        {7{videx_data_r[23] ^ (videx_cursor_active_w && videx_cursor_byte_w == 2'd2)}};
                 end
                 // Stage 5: Capture char 3 pixels
                 STAGE_VIDEX_5: begin
-                    pix_buffer_r[27:21] <= (videx_cursor_active_w && videx_cursor_byte_w == 2'd3) ?
-                        videxrom_d_r[6:0] ^ 7'h7F : videxrom_d_r[6:0];
+                    pix_buffer_r[27:21] <= videxrom_d_r[6:0] ^
+                        {7{videx_data_r[31] ^ (videx_cursor_active_w && videx_cursor_byte_w == 2'd3)}};
                 end
                 // prepare for next cycle
                 STAGE_LOAD_SHIFT: begin
