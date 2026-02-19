@@ -94,15 +94,6 @@ interface a2mem_if;
 
         output SLOTROM,
 
-        output VIDEX_MODE,
-        output VIDEX_CRTC_R9,
-        output VIDEX_CRTC_R10,
-        output VIDEX_CRTC_R11,
-        output VIDEX_CRTC_R12,
-        output VIDEX_CRTC_R13,
-        output VIDEX_CRTC_R14,
-        output VIDEX_CRTC_R15,
-
         output TEXT_COLOR,
         output BACKGROUND_COLOR,
         output BORDER_COLOR,
@@ -161,6 +152,18 @@ interface a2mem_if;
 
         input keycode,
         input keypress_strobe
+    );
+
+    modport videx (
+        output VIDEX_MODE,
+        output VIDEX_CRTC_R9,
+        output VIDEX_CRTC_R10,
+        output VIDEX_CRTC_R11,
+        output VIDEX_CRTC_R12,
+        output VIDEX_CRTC_R13,
+        output VIDEX_CRTC_R14,
+        output VIDEX_CRTC_R15,
+        input  INTCXROM
     );
 
 endinterface: a2mem_if

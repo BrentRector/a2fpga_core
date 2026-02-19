@@ -43,6 +43,8 @@
         <File path="../../hdl/ssc/ssc_rom.vhd" type="file.vhdl" enable="1"/>
         <File path="../../hdl/ssc/super_serial_card.sv" type="file.verilog" enable="1"/>
         <File path="../../hdl/supersprite/supersprite.sv" type="file.verilog" enable="1"/>
+        <File path="../../hdl/videx/videx_card.sv" type="file.verilog" enable="1"/>
+        <File path="../../hdl/videx/videx_rom.hex" type="file.other" enable="1"/>
         <File path="../../hdl/support/cdc_denoise.sv" type="file.verilog" enable="1"/>
         <File path="../../hdl/support/cdc_sampling.sv" type="file.verilog" enable="1"/>
         <File path="../../hdl/support/debounce.sv" type="file.verilog" enable="1"/>

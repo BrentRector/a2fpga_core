@@ -21,8 +21,7 @@
 //
 
 module apple_memory #(
-    parameter VGC_MEMORY = 0,  // 1 = extend aux memory to 32KB for VGC, 0 = 16KB
-    parameter VIDEX_SUPPORT = 0 // 1 = enable Videx VideoTerm passive monitoring
+    parameter VGC_MEMORY = 0  // 1 = extend aux memory to 32KB for VGC, 0 = 16KB
 ) (
     a2bus_if.slave a2bus_if,
     a2mem_if.master a2mem_if,
@@ -34,12 +33,7 @@ module apple_memory #(
     input vgc_active_i,
     input [12:0] vgc_address_i,
     input vgc_rd_i,
-    output [31:0] vgc_data_o,
-
-    // Videx VRAM read port (active when VIDEX_SUPPORT=1)
-    input [8:0] videx_vram_addr_i,
-    input videx_vram_rd_i,
-    output [31:0] videx_vram_data_o
+    output [31:0] vgc_data_o
 
 );
 
@@ -171,95 +165,6 @@ module apple_memory #(
 
     assign a2mem_if.keycode = keycode_r;
     assign a2mem_if.keypress_strobe = keypress_strobe_r;
-
-    // ------------------------------------------------
-    // Videx VideoTerm passive monitoring
-    // ------------------------------------------------
-
-    generate
-        if (VIDEX_SUPPORT) begin : videx_gen
-
-            // CRTC register index and register file
-            reg [4:0] videx_crtc_idx;
-            reg [7:0] videx_crtc_regs[18];
-            reg [10:0] videx_bankofs;  // VRAM bank offset (0x000, 0x200, 0x400, 0x600)
-
-            // Mode detection: sticky flag set on first CRTC write
-            reg videx_mode_r;
-
-            always @(posedge a2bus_if.clk_logic or negedge a2bus_if.system_reset_n) begin
-                if (!a2bus_if.system_reset_n) begin
-                    videx_crtc_idx <= 5'h0;
-                    videx_bankofs <= 11'h0;
-                    videx_mode_r <= 1'b0;
-                    for (int i = 0; i < 18; i++)
-                        videx_crtc_regs[i] <= 8'h00;
-                end else if ((a2bus_if.phi1_posedge) && !a2bus_if.m2sel_n &&
-                             (a2bus_if.addr[15:4] == 12'hC0B)) begin
-                    // Bank selection on ANY $C0Bx access (read or write)
-                    videx_bankofs <= {a2bus_if.addr[3:2], 9'b0};  // bits [3:2] × 512
-
-                    // CRTC register capture on writes only
-                    if (!a2bus_if.rw_n) begin
-                        videx_mode_r <= 1'b1;  // Videx detected
-                        if (!a2bus_if.addr[0])  // even address = index select
-                            videx_crtc_idx <= a2bus_if.data[4:0];
-                        else if (videx_crtc_idx < 5'd16)  // odd address = data write
-                            videx_crtc_regs[videx_crtc_idx] <= a2bus_if.data[7:0];
-                    end
-                end
-            end
-
-            assign a2mem_if.VIDEX_MODE = videx_mode_r;
-            assign a2mem_if.VIDEX_CRTC_R9  = {4'h0, videx_crtc_regs[9][3:0]};
-            assign a2mem_if.VIDEX_CRTC_R10 = videx_crtc_regs[10];
-            assign a2mem_if.VIDEX_CRTC_R11 = videx_crtc_regs[11];
-            assign a2mem_if.VIDEX_CRTC_R12 = videx_crtc_regs[12];
-            assign a2mem_if.VIDEX_CRTC_R13 = videx_crtc_regs[13];
-            assign a2mem_if.VIDEX_CRTC_R14 = videx_crtc_regs[14];
-            assign a2mem_if.VIDEX_CRTC_R15 = videx_crtc_regs[15];
-
-            // Videx VRAM write capture — use videx_mode_r (not SLOTROM) as the
-            // guard because the A2DVI v4.4 actively emulates the Videx card
-            // and may not follow the standard C8 space activation protocol
-            // (SLOTROM can be 0 after $CFFF access even though the emulated
-            // Videx still responds to $CC00-$CDFF).  Also inline the
-            // write_strobe expression to avoid Gowin synthesis scoping issues
-            // with module-level wires inside generate blocks.
-            wire videx_vram_write_enable = !a2bus_if.rw_n &&
-                                           a2bus_if.data_in_strobe &&
-                                           videx_mode_r &&
-                                           (a2bus_if.addr[15:9] == 7'b1100_110);  // $CC00-$CDFF
-
-            // Full VRAM address = bank offset + (bus_addr & 0x1FF)
-            wire [10:0] videx_vram_waddr = videx_bankofs + {2'b0, a2bus_if.addr[8:0]};
-
-            // Videx VRAM shadow (2 KB = 512 × 32-bit words)
-            sdpram32 #(.ADDR_WIDTH(9)) videx_vram (
-                .clk(a2bus_if.clk_logic),
-                .write_addr(videx_vram_waddr[10:2]),
-                .write_data({a2bus_if.data, a2bus_if.data, a2bus_if.data, a2bus_if.data}),
-                .write_enable(videx_vram_write_enable),
-                .byte_enable(4'(1 << videx_vram_waddr[1:0])),
-                .read_addr(videx_vram_addr_i),
-                .read_enable(videx_vram_rd_i),
-                .read_data(videx_vram_data_o)
-            );
-
-        end else begin : no_videx_gen
-
-            assign a2mem_if.VIDEX_MODE = 1'b0;
-            assign a2mem_if.VIDEX_CRTC_R9  = 8'h0;
-            assign a2mem_if.VIDEX_CRTC_R10 = 8'h0;
-            assign a2mem_if.VIDEX_CRTC_R11 = 8'h0;
-            assign a2mem_if.VIDEX_CRTC_R12 = 8'h0;
-            assign a2mem_if.VIDEX_CRTC_R13 = 8'h0;
-            assign a2mem_if.VIDEX_CRTC_R14 = 8'h0;
-            assign a2mem_if.VIDEX_CRTC_R15 = 8'h0;
-            assign videx_vram_data_o = 32'h0;
-
-        end
-    endgenerate
 
     logic aux_mem_r;
     

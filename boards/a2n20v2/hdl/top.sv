@@ -36,6 +36,9 @@ module top #(
     parameter bit SUPERSERIAL_IRQ_ENABLE = 1,
     parameter bit [7:0] SUPERSERIAL_ID = 3,
 
+    parameter bit VIDEX_CARD_ENABLE = 1,
+    parameter bit [7:0] VIDEX_CARD_ID = 5,
+
     parameter bit CLEAR_APPLE_VIDEO_RAM = 1,    // Clear video ram on startup
     parameter bit HDMI_SLEEP_ENABLE = 1,        // Sleep HDMI output on CPU stop
     parameter bit IRQ_OUT_ENABLE = 1,           // Allow driving IRQ to Apple bus
@@ -229,14 +232,13 @@ module top #(
     wire vgc_rd_w;
     wire [31:0] vgc_data_w;
 
-    // Videx VRAM read port (apple_video → apple_memory)
+    // Videx VRAM read port (apple_video → videx_card)
     wire [8:0] videx_vram_addr_w;
     wire videx_vram_rd_w;
     wire [31:0] videx_vram_data_w;
 
     apple_memory #(
-        .VGC_MEMORY(1),
-        .VIDEX_SUPPORT(1)
+        .VGC_MEMORY(1)
     ) apple_memory (
         .a2bus_if(a2bus_if),
         .a2mem_if(a2mem_if),
@@ -248,11 +250,7 @@ module top #(
         .vgc_active_i(vgc_active_w),
         .vgc_address_i(vgc_address_w),
         .vgc_rd_i(vgc_rd_w),
-        .vgc_data_o(vgc_data_w),
-
-        .videx_vram_addr_i(videx_vram_addr_w),
-        .videx_vram_rd_i(videx_vram_rd_w),
-        .videx_vram_data_o(videx_vram_data_w)
+        .vgc_data_o(vgc_data_w)
     );
 
     // Slots
@@ -301,7 +299,7 @@ module top #(
     wire [7:0] apple_vga_b;
 
     apple_video #(
-        .VIDEX_SUPPORT(1)
+        .VIDEX_SUPPORT(VIDEX_CARD_ENABLE)
     ) apple_video (
         .a2bus_if(a2bus_if),
         .a2mem_if(a2mem_if),
@@ -481,13 +479,48 @@ module top #(
         .uart_tx_o(ssc_uart_tx)
     );
 
+    // Videx VideoTerm 80-Column Card
+
+    wire [7:0] videx_d_w;
+    wire videx_rd;
+    wire videx_rom_en;
+
+    generate if (VIDEX_CARD_ENABLE) begin : videx_card_gen
+        videx_card #(.ENABLE(VIDEX_CARD_ENABLE), .ID(VIDEX_CARD_ID)) videx (
+            .a2bus_if(a2bus_if),
+            .a2mem_if(a2mem_if),
+            .slot_if(slot_if),
+            .data_o(videx_d_w),
+            .rd_en_o(videx_rd),
+            .rom_en_o(videx_rom_en),
+            .videx_vram_addr_i(videx_vram_addr_w),
+            .videx_vram_rd_i(videx_vram_rd_w),
+            .videx_vram_data_o(videx_vram_data_w)
+        );
+    end else begin : no_videx_card_gen
+        assign videx_d_w = 8'b0;
+        assign videx_rd = 1'b0;
+        assign videx_rom_en = 1'b0;
+        assign videx_vram_data_w = 32'b0;
+        // Default VIDEX signals when card disabled
+        assign a2mem_if.VIDEX_MODE = 1'b0;
+        assign a2mem_if.VIDEX_CRTC_R9  = 8'h0;
+        assign a2mem_if.VIDEX_CRTC_R10 = 8'h0;
+        assign a2mem_if.VIDEX_CRTC_R11 = 8'h0;
+        assign a2mem_if.VIDEX_CRTC_R12 = 8'h0;
+        assign a2mem_if.VIDEX_CRTC_R13 = 8'h0;
+        assign a2mem_if.VIDEX_CRTC_R14 = 8'h0;
+        assign a2mem_if.VIDEX_CRTC_R15 = 8'h0;
+    end endgenerate
+
     // Data output
 
-    assign data_out_en_w = ssp_rd || mb_rd || ssc_rd;
+    assign data_out_en_w = ssp_rd || mb_rd || ssc_rd || videx_rd;
 
-    assign data_out_w = ssc_rd ? ssc_d_w :
-        ssp_rd ? ssp_d_w : 
-        mb_rd ? mb_d_w : 
+    assign data_out_w = videx_rd ? videx_d_w :
+        ssc_rd ? ssc_d_w :
+        ssp_rd ? ssp_d_w :
+        mb_rd ? mb_d_w :
         a2bus_if.data;
 
     // Interrupts
