@@ -9,19 +9,25 @@ This specification defines every hardware behavior the virtual Videx card module
 ## 1. Module Interface
 
 ```systemverilog
-module videx_card (
+module videx_card #(
+    parameter bit [7:0] ID = 5,
+    parameter bit ENABLE = 1'b1
+) (
     a2bus_if.slave   a2bus_if,
-    a2mem_if.slave   a2mem_if,
+    a2mem_if.slave   a2mem_if,       // reads INTCXROM for C8 space gating
+    slot_if.card     slot_if,        // slot system (same pattern as Mockingboard/SSC)
 
-    // Directly from slotmaker for slot 3
-    input wire       dev_select_n,    // active when addr[6:4]==3 && addr[15:12]==$C
-    input wire       io_select_n,     // active when addr[10:8]==3 && addr[15:11]==$C (slot ROM)
-    input wire       io_strobe_n,     // active when addr[15:11]==$19 ($C800-$CFFF)
-
-    output reg [7:0] data_o,          // data driven onto bus for reads
-    output reg       rd_en_o          // active when card is driving data_o
+    output [7:0]     data_o,         // data driven onto bus for reads
+    output           rd_en_o,        // active when card is driving data_o
+    output           rom_en_o        // C8 space ownership status (SSC pattern)
 );
 ```
+
+The card follows the same `slot_if.card` pattern as `Mockingboard` and `SuperSerial`:
+- `ID` parameter: unique card identifier (5 = Videx), matched against `slots.hex` assignment
+- `ENABLE` parameter: compile-time enable (card synthesizes away when 0)
+- `slot_if.card` modport provides: `slot`, `card_id`, `io_select_n`, `dev_select_n`, `io_strobe_n`, `config_select_n`, `card_config`, `card_enable`
+- `rom_en_o`: expansion ROM ownership flag, follows SSC `C8S2` pattern (exported for status, not consumed by top.sv)
 
 The card does **not** generate interrupts (`irq_n` is not needed — the real Videx had no IRQ).
 
@@ -33,7 +39,7 @@ The card responds to three address regions. All decoding is active during `phi1_
 
 ### 2.1 Device I/O: `$C0B0–$C0BF`
 
-Active when `dev_select_n` is asserted (active-low). The slot 3 device select range is `$C0B0–$C0BF` (16 addresses).
+Active when `slot_if.dev_select_n` is asserted (active-low) and `slot_if.card_id == ID`. The slot 3 device select range is `$C0B0–$C0BF` (16 addresses).
 
 | Bits | Meaning |
 |------|---------|
@@ -42,11 +48,11 @@ Active when `dev_select_n` is asserted (active-low). The slot 3 device select ra
 
 ### 2.2 Slot ROM: `$C300–$C3FF`
 
-Active when `io_select_n` is asserted. The card drives `data_o` with the firmware ROM byte at offset `addr[7:0]`. This also sets the expansion ROM ownership flag.
+Active when `slot_if.io_select_n` is asserted. The card drives `data_o` with the firmware ROM byte at offset `addr[7:0]`. This also sets the expansion ROM ownership flag.
 
 ### 2.3 Expansion ROM: `$C800–$CFFF`
 
-Active when `io_strobe_n` is asserted **and** the card owns the expansion ROM space (ownership flag is set). The card drives `data_o` with the firmware ROM byte. The VRAM window at `$CC00–$CDFF` overlaps this range — see Section 5.
+Active when `slot_if.io_strobe_n` is asserted **and** the card owns the expansion ROM space (ownership flag is set). The card drives `data_o` with the firmware ROM byte. The VRAM window at `$CC00–$CDFF` overlaps this range — see Section 5.
 
 ### 2.4 VRAM Window: `$CC00–$CDFF`
 
@@ -64,7 +70,7 @@ Any access to `$CFFF` clears the expansion ROM ownership flag. The Videx firmwar
 
 ```
 Ownership flag (1 bit):
-  SET   when CPU accesses $C300–$C3FF (io_select_n asserted)
+  SET   when CPU accesses $C300–$C3FF (slot_if.io_select_n asserted)
   CLEAR when CPU accesses $CFFF
   CLEAR on system reset
 ```
@@ -99,6 +105,8 @@ All writes also update the VRAM bank select from `addr[3:2]` (Section 2.1).
 **Even address**: Returns undefined (the MC6845 address register is write-only). The card should not drive `data_o`.
 
 **Odd address**: If `crtc_idx` is 14 or 15, drive `crtc_regs[crtc_idx]` onto `data_o` and assert `rd_en_o`. For all other register indices, do not drive the bus (registers R0–R13 are write-only on the HD46505SP/MC6845 Type 0 used in the Videx).
+
+**Note on HD46505SP R12/R13 readability**: Some HD46505SP datasheets indicate R12 and R13 are also readable (unlike the MC6845 where they are write-only). The implementation only supports R14/R15 read-back, matching MC6845 Type 0 behavior. No known Apple II software reads R12/R13 from the Videx. If needed in the future, the fix is trivial: change `crtc_idx == 14 || crtc_idx == 15` to `crtc_idx >= 12 && crtc_idx <= 15`.
 
 **Why R14/R15 read-back matters**: The Videx ROM itself never reads CRTC registers. However, third-party detection software writes a test value to R14, then reads it back — if the value matches, a Videx card is present. Without read-back, these programs fail to detect the card.
 
@@ -261,7 +269,7 @@ The ROM tracks the scroll offset in the `START` screen hole (`$06FB`). `START` r
 | Copy | Purpose | Storage | Read Port User |
 |------|---------|---------|---------------|
 | Shadow VRAM | Video rendering | `sdpram32` in `apple_memory.sv` (existing) | `VIDEX_LINE` pipeline in `apple_video.sv` |
-| Card VRAM | CPU read-back | New `sdpram32` or simple BSRAM in `videx_card.sv` | CPU reads of `$CC00–$CDFF` |
+| Card VRAM | CPU read-back | Simple byte-addressable BSRAM in `videx_card.sv` | CPU reads of `$CC00–$CDFF` |
 
 Both receive identical writes (from the same bus transactions). The shadow's write capture continues to work because it snoops bus writes — the card's presence doesn't change what appears on the bus during writes.
 
@@ -292,7 +300,7 @@ Loaded from `videx_rom.hex` via `$readmemh`.
 
 ```
 if slot ROM access ($C300–$C3FF):
-    data_o <= rom[{1'b1, addr[7:0]}]    // offset $100–$1FF maps to ROM $300–$3FF
+    data_o <= rom[{2'b11, addr[7:0]}]   // 10-bit index, offset $300–$3FF
     rd_en_o <= 1
 
 if expansion ROM access ($C800–$CBFF) and ownership flag set:
@@ -331,6 +339,16 @@ These bytes in the slot ROM are checked by software for card detection:
 
 These are part of the ROM content and require no special hardware handling — they're just bytes served from the ROM image.
 
+**ProDOS IIe detection note**: ProDOS on the Apple IIe checks a fifth byte at `$CnFA` (offset `$3FA`) for `$2C` to identify 80-column cards. The Videx ROM has `$C4` at this offset, not `$2C`. This is historically accurate — the original Videx VideoTerm ROM predates the IIe convention. On Apple ][/][+, ProDOS uses the standard 4-byte Pascal 1.1 protocol above and detects the card correctly. No ROM patch is applied.
+
+### 6.6 SLOTC3ROM — Apple IIe Compatibility
+
+This emulation targets Apple ][/][+. On an Apple IIe, the motherboard's `SLOTC3ROM` soft switch controls whether `$C300–$C3FF` is served by the internal ROM or by slot 3. By default (after reset), the IIe serves its own ROM at `$C300`, hiding slot 3 cards. Software must execute `STA $C00B` to enable `SLOTC3ROM` before the Videx slot ROM becomes visible.
+
+The `slotmaker` does not gate `io_select_n` with `SLOTC3ROM` — this matches real Apple IIe behavior where `IOSELECT` is gated by the motherboard, not by the card. The `slot_iostrobe_n` signal in `slotmaker.sv` is already gated by `a2mem_if.INTCXROM` and `a2mem_if.INTC8ROM`, which handles the IIe's internal ROM override correctly.
+
+On A2FPGA boards with `VIDEX_CARD_ENABLE=0` (all boards except `a2n20v2`), this is irrelevant.
+
 ---
 
 ## 7. Annunciator 0 (AN0) — Display Mode Switching
@@ -362,6 +380,10 @@ The Videx firmware stores its working state in Apple II "screen holes" — addre
 | `$06FB` | START | Scroll offset (0–127). Display start = START × 16 |
 | `$077B` | POFF | Power-off detection / lead-in state. `$30` = initialized |
 | `$07FB` | FLAGS | Bit 0: inverse. Bit 3: exit-to-40col. Bit 6: case. Bit 7: GETLN |
+| `$04F8` | TEMP_ROW | Temporary row storage during cursor positioning |
+| `$05F8` | TEMP_CHORZ | Temporary horizontal position during cursor positioning |
+| `$0678` | LAST_CHAR | Last character saved (used in PUTC/KEYPROC) |
+| `$067B` | TEMP_CHAR | Temporary character save during PUTC processing |
 
 ---
 
@@ -430,49 +452,72 @@ crtc_regs[*]  <= 0;
 // VRAM: no reset needed (firmware clears it during init)
 ```
 
-### Per-Cycle Logic (on phi1_posedge, !m2sel_n)
+### Per-Cycle Logic
+
+Uses the card enable and slot_if selection pattern from Mockingboard/SSC:
+
+```systemverilog
+// Selection signals (following Mockingboard/SSC pattern)
+wire card_sel     = card_enable && (slot_if.card_id == ID) && a2bus_if.phi0;
+wire card_dev_sel = card_sel && !slot_if.dev_select_n;    // $C0Bx during phi0
+wire card_io_sel  = card_sel && !slot_if.io_select_n;     // $C300-$C3FF during phi0
+wire card_io_strobe = !slot_if.io_strobe_n && a2bus_if.phi0;  // $C800-$CFFF during phi0
+
+// C8 space ownership
+wire rom_c8_active = rom_ownership && !a2mem_if.INTCXROM;
+
+// VRAM and expansion ROM address ranges
+wire vram_window   = (a2bus_if.addr[15:9] == 7'b1100_110);    // $CC00-$CDFF
+wire exp_rom_range = (a2bus_if.addr[15:10] == 6'b110010);     // $C800-$CBFF
+```
+
+**Writes** — captured on `phi1_posedge` using direct address decode (same timing as shadow):
 
 ```
-// 1. Bank select — on ANY $C0Bx access
-if (dev_select_n == 0)
+// 1. Bank select — on ANY $C0Bx access (read or write)
+on phi1_posedge, if card_enable && addr[15:4] == $C0B && !m2sel_n:
     bank_sel <= addr[3:2];
 
 // 2. CRTC writes
-if (dev_select_n == 0 && !rw_n)
-    if (addr[0] == 0)
-        crtc_idx <= data[4:0];          // address register
-    else if (crtc_idx < 16)
-        crtc_regs[crtc_idx] <= data;    // data register
+    if (!rw_n)
+        if (addr[0] == 0)
+            crtc_idx <= data[4:0];          // address register
+        else if (crtc_idx < 16)
+            crtc_regs[crtc_idx] <= data;    // data register
 
-// 3. CRTC reads (R14/R15 only)
-if (dev_select_n == 0 && rw_n && addr[0] == 1)
-    if (crtc_idx == 14 || crtc_idx == 15)
-        data_o <= crtc_regs[crtc_idx];
-        rd_en_o <= 1;
-
-// 4. Slot ROM read → set ownership
-if (io_select_n == 0 && rw_n)
-    rom_ownership <= 1;
-    data_o <= rom[{1'b1, addr[7:0]}];
-    rd_en_o <= 1;
-
-// 5. VRAM write
-if (rom_ownership && addr is $CC00–$CDFF && !rw_n)
+// 3. VRAM write
+on data_in_strobe, if rom_c8_active && vram_window && !rw_n:
     vram[{bank_sel, addr[8:0]}] <= data;
 
-// 6. VRAM read
-if (rom_ownership && addr is $CC00–$CDFF && rw_n)
-    data_o <= vram[{bank_sel, addr[8:0]}];
-    rd_en_o <= 1;
+// 4. Slot ROM access → set ownership
+on posedge clk_logic, if card_io_sel:
+    rom_ownership <= 1;
 
-// 7. Expansion ROM read (not VRAM range)
-if (rom_ownership && io_strobe_n == 0 && addr is $C800–$CBFF && rw_n)
-    data_o <= rom[addr[9:0]];
-    rd_en_o <= 1;
-
-// 8. $CFFF → clear ownership
-if (addr == $CFFF)
+// 5. $CFFF → clear ownership
+on posedge clk_logic, if addr == $CFFF && !INTCXROM:
     rom_ownership <= 0;
+```
+
+**Reads** — driven during phi0 via selection signals:
+
+```
+// 6. CRTC reads (R14/R15 only) — combinational
+if card_dev_sel && rw_n && addr[0] == 1 && (crtc_idx == 14 || crtc_idx == 15):
+    data_o = crtc_regs[crtc_idx];
+
+// 7. Slot ROM read — registered (1-cycle latency)
+if card_io_sel && rw_n:
+    data_o = rom[{2'b11, addr[7:0]}];       // last 256 bytes of 1KB ROM
+
+// 8. VRAM read — registered
+if rom_c8_active && vram_window && rw_n:
+    data_o = vram[{bank_sel, addr[8:0]}];
+
+// 9. Expansion ROM read (not VRAM range) — registered
+if rom_c8_active && card_io_strobe && exp_rom_range && rw_n:
+    data_o = rom[addr[9:0]];                 // full 1KB ROM
+
+// rd_en_o = card_enable && rw_n && (any of cases 6-9)
 ```
 
 ### Shadow Interaction
@@ -483,36 +528,68 @@ The card does **not** write to `a2mem_if.VIDEX_CRTC_R*` signals directly. The ex
 
 ## 12. Integration into Board Top-Level
 
-### 12.1 Instantiation
+### 12.1 Parameters
 
-Add to `boards/a2n20v2/hdl/top.sv` (gated by `VIDEX_SUPPORT` parameter):
+Add to `boards/a2n20v2/hdl/top.sv` module parameters:
 
 ```systemverilog
-generate if (VIDEX_SUPPORT) begin : videx_card_gen
-    videx_card videx_card_inst (
+parameter bit VIDEX_CARD_ENABLE = 1,
+parameter bit [7:0] VIDEX_CARD_ID = 5,
+```
+
+Couple `VIDEX_SUPPORT` with `VIDEX_CARD_ENABLE` — there is no standalone shadow mode:
+
+```systemverilog
+apple_memory #(.VGC_MEMORY(1), .VIDEX_SUPPORT(VIDEX_CARD_ENABLE)) apple_memory (...);
+apple_video  #(.VIDEX_SUPPORT(VIDEX_CARD_ENABLE)) apple_video (...);
+```
+
+### 12.2 Instantiation
+
+The card follows the same `slot_if.card` pattern as Mockingboard and SSC. It is gated by a generate block:
+
+```systemverilog
+wire [7:0] videx_d_w;
+wire videx_rd;
+wire videx_rom_en;
+
+generate if (VIDEX_CARD_ENABLE) begin : videx_card_gen
+    videx_card #(.ENABLE(VIDEX_CARD_ENABLE), .ID(VIDEX_CARD_ID)) videx (
         .a2bus_if(a2bus_if),
         .a2mem_if(a2mem_if),
-        .dev_select_n(slot3_dev_select_n),
-        .io_select_n(slot3_io_select_n),
-        .io_strobe_n(slot3_io_strobe_n),
-        .data_o(videx_data_o),
-        .rd_en_o(videx_rd_en_o)
+        .slot_if(slot_if),
+        .data_o(videx_d_w),
+        .rd_en_o(videx_rd),
+        .rom_en_o(videx_rom_en)
     );
+end else begin : no_videx_card_gen
+    assign videx_d_w = 8'b0;
+    assign videx_rd = 1'b0;
+    assign videx_rom_en = 1'b0;
 end endgenerate
 ```
 
-### 12.2 Bus Multiplexer
+### 12.3 Bus Multiplexer
 
 Add card's data output to the existing bus mux:
 
 ```systemverilog
-assign data_out_w = videx_rd_en_o ? videx_data_o : /* existing chain */;
-assign data_out_en_w = videx_rd_en_o | /* existing chain */;
+assign data_out_en_w = ssp_rd || mb_rd || ssc_rd || videx_rd;
+assign data_out_w = videx_rd ? videx_d_w :
+    ssc_rd ? ssc_d_w : ssp_rd ? ssp_d_w : mb_rd ? mb_d_w : a2bus_if.data;
 ```
 
-### 12.3 Slot Assignment
+No IRQ change — the Videx card has no IRQ.
 
-The card must be wired to slot 3's select signals from `slotmaker`. If `slotmaker` uses `slots.hex` for card assignment, update entry 3 to the Videx card ID. If wired directly, connect the slot 3 select lines.
+### 12.4 Slot Assignment
+
+Update `hdl/slots/slots.hex` to assign Videx card ID 5 to slot 3:
+
+```
+00 00 03 05 02 04 00 01
+```
+
+The slotmaker module reads this file at initialization, configures slot 3 with card_id=5, and routes the slot 3 select signals to all cards via `slot_if`. The videx_card's enable logic matches on `slot_if.card_id == ID` during configuration.
 
 ---
 
@@ -578,9 +655,10 @@ The shadow's existing `videx_vram` BSRAM (1 block) is unchanged. Total Videx BSR
 
 | File | Action | Description |
 |------|--------|-------------|
-| `hdl/videx/videx_card.sv` | **Create** | Virtual card module (~300–400 lines) |
-| `hdl/videx/videx_rom.hex` | **Create** | Videx VideoTerm ROM 2.4 image (1 KB, hex format) |
-| `boards/a2n20v2/hdl/top.sv` | **Modify** | Instantiate card, wire to bus mux and slot 3 selects |
+| `hdl/videx/videx_card.sv` | **Create** | Virtual card module (~300 lines), follows Mockingboard/SSC `slot_if.card` pattern |
+| `hdl/videx/videx_rom.hex` | **Exists** | Videx VideoTerm ROM 2.4 image (1 KB, hex format) — already created |
+| `boards/a2n20v2/hdl/top.sv` | **Modify** | Add `VIDEX_CARD_ENABLE`/`VIDEX_CARD_ID` params, instantiate card, wire to bus mux, couple `VIDEX_SUPPORT` with `VIDEX_CARD_ENABLE` |
+| `hdl/slots/slots.hex` | **Modify** | Assign Videx card ID 5 to slot 3 |
 | `hdl/memory/apple_memory.sv` | **No change** | Shadow capture continues to work as-is |
 | `hdl/video/apple_video.sv` | **No change** | VIDEX_LINE renderer continues to work as-is |
 | `hdl/memory/a2mem_if.sv` | **No change** | VIDEX signals already defined |
@@ -624,7 +702,12 @@ The shadow's existing `videx_vram` BSRAM (1 block) is unchanged. Total Videx BSR
 - [ ] Cursor is full-height block (scanlines 0–8)
 - [ ] Inverse characters display correctly (CTRL-O to enable, CTRL-N to disable)
 
-### 16.6 Mode Switching
+### 16.6 ESC Sequences
+
+- [ ] ESC + row + column cursor positioning (used by terminal emulators like ProTERM)
+- [ ] All ESC-@ through ESC-G sequences (see firmware `OUTPT1` at `$CA89` and POFF state machine)
+
+### 16.7 Mode Switching
 
 - [ ] `CTRL-Z` + `'1'` switches to 40-column mode (AN0 off)
 - [ ] `CTRL-Z` + `'0'` reinitializes card

@@ -24,11 +24,12 @@ This session has two goals:
 │   │   ├── apple_video.sv       # Video renderer, VIDEX_LINE pipeline (VIDEX_SUPPORT generate block)
 │   │   └── videx_charrom.hex    # Videx character ROM (4 KB, 256 chars × 16 bytes)
 │   ├── videx/
+│   │   ├── videx_card.sv        # (TO CREATE) Virtual Videx card module — bus responses
 │   │   └── videx_rom.hex        # Videx VideoTerm firmware ROM 2.4 (1 KB)
 │   ├── slots/
 │   │   ├── slotmaker.sv         # Virtual slot controller, address decode, card config
 │   │   ├── slot_if.sv           # Slot interface definition (slot, card_id, select signals)
-│   │   └── slots.hex            # Default: 00 00 03 00 02 04 00 01 (slot 3 = empty)
+│   │   └── slots.hex            # Current: 00 00 03 00 02 04 00 01 (slot 3 = empty → will be 05)
 │   ├── mockingboard/
 │   │   └── mockingboard.sv      # Mockingboard card (ENABLE, ID parameters)
 │   ├── ssc/
@@ -166,69 +167,63 @@ assign irq_n_w = mb_irq_n && vdp_irq_n && ssc_irq_n;
 
 ---
 
-## Goal 1: Should Shadow and Emulation Be Combined?
+## Goal 1: Shadow and Emulation Architecture — DECIDED
 
-### Current Dual Architecture
+### Decision: Shadow and card work together, no standalone shadow mode
+
+The shadow capture in `apple_memory.sv` and the card module in `videx_card.sv` both maintain CRTC registers and VRAM state. This redundancy is intentional — each copy serves a different purpose:
+
+- **Shadow CRTC registers** → feed `a2mem_if.VIDEX_CRTC_R*` → drive the `VIDEX_LINE` renderer
+- **Card CRTC registers** → serve CPU read-back (R14/R15) for card detection and cursor queries
+- **Shadow VRAM** (`sdpram32`) → feed the video scanner read port for rendering
+- **Card VRAM** (new BSRAM) → serve CPU read-back for programs that read VRAM
+
+Both capture the same bus writes. The shadow snoops writes that the card also processes — the card's bus activity is visible to the shadow.
+
 ```
-apple_memory.sv                     videx_card.sv (new)
-  videx_gen generate block            - Firmware ROM (1 KB BSRAM)
-  - CRTC reg snooping                 - CRTC register file (16 × 8-bit)
-  - VRAM write snooping (2 KB)        - VRAM for read-back (2 KB BSRAM)
-  - Bank selection snooping            - Bus response logic
-  - VIDEX_MODE flag                    - Expansion ROM ownership
+videx_card.sv (new)                 apple_memory.sv (unchanged)
+  - Firmware ROM (1 KB BSRAM)         videx_gen generate block
+  - CRTC register file (R0-R15)       - CRTC reg snooping → a2mem_if.VIDEX_CRTC_R*
+  - VRAM for CPU read-back (2 KB)     - VRAM write snooping (2 KB) → scanner read port
+  - Bus response logic                - Bank selection snooping
+  - Expansion ROM ownership           - VIDEX_MODE flag
        ↓                                    ↓
-  a2mem_if.VIDEX_CRTC_R*            (card's bus responses are snooped
-  videx_vram (read port)              by the shadow, so shadow auto-fills)
-       ↓
-apple_video.sv
-  VIDEX_LINE pipeline → HDMI
+  data_o / rd_en_o → bus mux         apple_video.sv
+  (ROM, CRTC readback, VRAM readback)  VIDEX_LINE pipeline → HDMI
 ```
 
-### The Question
-The shadow capture in `apple_memory.sv` and the card module in `videx_card.sv` both maintain CRTC registers and VRAM state. Can these be unified? Specifically:
-
-- **CRTC registers**: Shadow stores R9–R15 in `a2mem_if.VIDEX_CRTC_R*`. Card stores R0–R15. Could the card write directly to `a2mem_if` instead of having the shadow snoop?
-- **VRAM**: Shadow has 2 KB `sdpram32` (write: bus, read: scanner). Card needs 2 KB for CPU read-back. Could a single dual-port RAM serve both (one port for CPU reads, one for scanner reads)?
-- **Bank selection**: Both track `addr[3:2]`. Redundant.
-- **VIDEX_MODE**: Shadow sets it on first CRTC write. Card could set it explicitly.
-
-### Key Constraint
-The **passive shadow must still work independently** for the use case where a real external Videx card (or A2DVI) is in slot 3 and A2FPGA is in a different slot. The shadow-only mode needs no card module. So the shadow logic cannot be removed — it must either be kept as-is or refactored into a shared component.
-
-### Considerations
-- Combining saves ~2 KB BSRAM (one VRAM copy instead of two) but requires a true dual-port RAM or time-multiplexed read port
-- The shadow in `apple_memory.sv` is ~80 lines of relatively simple snoop logic
-- The card in `videx_card.sv` would be ~400 lines of bus response logic
-- If combined, the module boundary between memory and card becomes blurry
+**There is no standalone "shadow-only" mode.** There is no viable use case for running both an A2FPGA card and a separate Videx card in the same system. `VIDEX_SUPPORT` is coupled with `VIDEX_CARD_ENABLE` — when the card is enabled, the shadow is enabled; when the card is disabled, the shadow is disabled. `apple_memory.sv` and `apple_video.sv` require **no changes**.
 
 ---
 
-## Goal 2: Configurable Videx Module
+## Goal 2: Configurable Videx Module — DECIDED
 
-### Requirements
-1. The Videx card should be buildable with `VIDEX_CARD_ENABLE = 1` / `VIDEX_CARD_ID = N` parameters, just like Mockingboard/SSC
-2. When disabled, the Videx card module should synthesize away to nothing
-3. The passive shadow rendering should remain independently controllable via `VIDEX_SUPPORT` parameter (it already is)
-4. Slot assignment should go through `slots.hex` and `slotmaker` like all other cards
-5. The card needs a unique ID (next available: 5, since 1=SuperSprite, 2=Mockingboard, 3=SSC, 4=DISK_II)
+### Decisions
+1. **Card ID = 5**, slot 3 (standard Videx slot)
+2. Follows Mockingboard/SSC `slot_if.card` pattern with `ID` and `ENABLE` parameters
+3. `VIDEX_SUPPORT` is coupled with `VIDEX_CARD_ENABLE` — no independent shadow mode
+4. Slot assignment goes through `slots.hex` and `slotmaker`
+5. Card includes `rom_en_o` output following SSC pattern (exported for status, not consumed by top.sv)
 
 ### What Needs to Happen
 1. **Create `hdl/videx/videx_card.sv`** — New module implementing `slot_if.card`, following the Mockingboard/SSC pattern
-2. **Update `boards/a2n20v2/hdl/top.sv`** — Add `VIDEX_CARD_ENABLE`, `VIDEX_CARD_ID` parameters; instantiate the card; add to bus mux
-3. **Update `hdl/slots/slots.hex`** — Assign Videx card ID to slot 3
-4. **Update other board top.sv files** — Set `VIDEX_CARD_ENABLE = 0` for boards that don't support it
-5. **Evaluate** whether `VIDEX_SUPPORT` (shadow rendering) and `VIDEX_CARD_ENABLE` (active card) should be coupled or independent
+2. **Modify `boards/a2n20v2/hdl/top.sv`** — Add `VIDEX_CARD_ENABLE`, `VIDEX_CARD_ID` parameters; instantiate the card; add to bus mux; couple `VIDEX_SUPPORT` with `VIDEX_CARD_ENABLE`
+3. **Modify `hdl/slots/slots.hex`** — Assign Videx card ID 5 to slot 3
 
-### Board Support Matrix (Proposed)
+Other boards (`a2n20v2-Enhanced`, `a2n20v1`, `a2mega`, `a2n9`, `a2p25`) already pass `VIDEX_SUPPORT(0)` or omit it — no changes needed.
 
-| Board | VIDEX_SUPPORT (shadow) | VIDEX_CARD_ENABLE (emulation) |
-|-------|----------------------|------------------------------|
-| a2n20v2 | 1 | 1 |
-| a2n20v2-Enhanced | 0 | 0 |
-| a2n20v1 | 0 | 0 |
-| a2mega | 0 | 0 |
-| a2n9 | 0 | 0 |
-| a2p25 | 0 | 0 |
+### Board Support Matrix
+
+`VIDEX_SUPPORT` and `VIDEX_CARD_ENABLE` are coupled — shadow rendering is always active when the card is enabled, and always disabled when the card is disabled. The `VIDEX_SUPPORT` parameter passed to `apple_memory` and `apple_video` is set to `VIDEX_CARD_ENABLE`.
+
+| Board | VIDEX_CARD_ENABLE | Notes |
+|-------|-------------------|-------|
+| a2n20v2 | 1 | Full Videx emulation + shadow rendering |
+| a2n20v2-Enhanced | 0 | No Videx (already VIDEX_SUPPORT=0) |
+| a2n20v1 | 0 | No Videx |
+| a2mega | 0 | No Videx |
+| a2n9 | 0 | No Videx |
+| a2p25 | 0 | No Videx |
 
 ---
 
@@ -281,15 +276,17 @@ Read these files for complete details:
 ## What Has NOT Been Built Yet
 
 - `hdl/videx/videx_card.sv` — Does not exist. Must be created.
-- No changes have been made to `apple_memory.sv`, `apple_video.sv`, or any board `top.sv` for active emulation.
-- The `slots.hex` file still has slot 3 as empty (`00`).
+- `boards/a2n20v2/hdl/top.sv` — Not yet modified for Videx card instantiation.
+- `hdl/slots/slots.hex` — Still has slot 3 as empty (`00`), needs to be changed to `05`.
+- `apple_memory.sv` and `apple_video.sv` require **no changes** — shadow code stays as-is.
 - The passive shadow rendering and character ROM generation are complete and working.
-- All specification and evaluation documents are complete.
+- All specification and evaluation documents are complete and updated.
 
 ---
 
 ## Summary of Prior Session Work
 
+### Session 1: Shadow Pipeline and Specification
 1. Created the Videx shadow rendering pipeline (passive monitoring of external Videx cards)
 2. Generated the Videx character ROM from A2DVI font data
 3. Wrote comprehensive implementation specification for the virtual Videx card
@@ -297,3 +294,11 @@ Read these files for complete details:
 5. Obtained and verified the Videx VideoTerm ROM 2.4 firmware image
 6. Created complete annotated 6502 disassembly of the firmware ROM
 7. Documented character ROM anomalies (space char artifact, control code graphics, slashed zero, DEL checkerboard, true descenders, inverse half verification)
+
+### Session 2: Architecture Decisions and Spec Updates
+8. Decided shadow and card architecture: card adds bus responses, shadow stays unchanged in `apple_memory.sv`
+9. Decided `VIDEX_SUPPORT` is coupled with `VIDEX_CARD_ENABLE` — no standalone shadow mode
+10. Decided Card ID = 5, slot 3, following Mockingboard/SSC `slot_if.card` pattern
+11. Updated `VIDEX_IMPLEMENTATION_SPEC.md` with `slot_if.card` interface, selection signals, integration instructions
+12. Updated `VIDEX_SESSION_RESUME.md` with decided architecture and implementation plan
+13. Created implementation plan for `videx_card.sv`, `top.sv` modifications, and `slots.hex` update
