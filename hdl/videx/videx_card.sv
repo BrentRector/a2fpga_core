@@ -20,7 +20,7 @@
 // Combined Videx VideoTerm emulation providing:
 //   - Firmware ROM (1 KB VideoTerm ROM 2.4)
 //   - MC6845 CRTC register file with R14/R15 read-back
-//   - 2 KB VRAM with true dual-port (CPU + video scanner)
+//   - 2 KB VRAM via dual sdpram32 (scanner + CPU read-back)
 //   - Expansion ROM ownership protocol
 //   - a2mem_if VIDEX_* signals for the VIDEX_LINE renderer
 //
@@ -43,7 +43,7 @@ module videx_card #(
     // Scanner VRAM read port (wired to apple_video VIDEX_LINE pipeline)
     input [8:0]      videx_vram_addr_i,
     input            videx_vram_rd_i,
-    output reg [31:0] videx_vram_data_o
+    output [31:0] videx_vram_data_o
 );
 
     // ========================================================================
@@ -171,12 +171,12 @@ module videx_card #(
     wire crtc_read = card_dev_sel && a2bus_if.rw_n && a2bus_if.addr[0] && crtc_readable;
 
     // ========================================================================
-    // VRAM (2 KB, true dual-port BSRAM)
-    //   Port A: CPU read/write (32-bit words with byte enable)
-    //   Port B: Scanner read (32-bit, 4 chars per cycle)
+    // VRAM (2 KB, two sdpram32 instances for GoWin BSRAM inference)
+    //   Scanner VRAM: CPU writes + scanner reads (for apple_video)
+    //   CPU VRAM:     CPU writes + CPU reads (for VRAM read-back)
+    //   Both receive identical writes; separate read ports avoid DP inference
+    //   issues that cause GoWin to use 4+ DPB blocks instead of 2 SDPB.
     // ========================================================================
-
-    reg [31:0] vram[0:511];  // 512 x 32-bit = 2 KB
 
     // VRAM address computation
     wire [10:0] vram_addr = {bank_sel, a2bus_if.addr[8:0]};
@@ -191,29 +191,32 @@ module videx_card #(
     wire [31:0] vram_wdata = {a2bus_if.data, a2bus_if.data, a2bus_if.data, a2bus_if.data};
     wire [3:0]  vram_be = (4'b0001 << vram_byte_sel);
 
-    // Port A: CPU read/write
-    reg [31:0] vram_cpu_data_r;
-    reg [31:0] vram_cpu_data_rr;
+    // Scanner VRAM: CPU writes, scanner reads (sdpram32 = 1 SDPB)
+    sdpram32 #(.ADDR_WIDTH(9)) videx_vram_scan (
+        .clk(a2bus_if.clk_logic),
+        .write_addr(vram_word_addr),
+        .write_data(vram_wdata),
+        .write_enable(vram_we),
+        .byte_enable(vram_be),
+        .read_addr(videx_vram_addr_i),
+        .read_enable(videx_vram_rd_i),
+        .read_data(videx_vram_data_o)
+    );
 
-    always_ff @(posedge a2bus_if.clk_logic) begin
-        if (vram_we) begin
-            if (vram_be[0]) vram[vram_word_addr][7:0]   <= vram_wdata[7:0];
-            if (vram_be[1]) vram[vram_word_addr][15:8]  <= vram_wdata[15:8];
-            if (vram_be[2]) vram[vram_word_addr][23:16] <= vram_wdata[23:16];
-            if (vram_be[3]) vram[vram_word_addr][31:24] <= vram_wdata[31:24];
-        end
-        vram_cpu_data_r <= vram[vram_word_addr];
-        vram_cpu_data_rr <= vram_cpu_data_r;
-    end
+    // CPU VRAM: CPU writes, CPU reads (sdpram32 = 1 SDPB)
+    wire cpu_vram_rd = rom_c8_active && vram_window && a2bus_if.rw_n;
+    wire [31:0] vram_cpu_data;
 
-    // Port B: Scanner read (matches sdpram32 pipeline pattern for apple_video)
-    reg [31:0] vram_scan_data_r;
-
-    always_ff @(posedge a2bus_if.clk_logic) begin
-        if (videx_vram_rd_i)
-            vram_scan_data_r <= vram[videx_vram_addr_i];
-        videx_vram_data_o <= vram_scan_data_r;
-    end
+    sdpram32 #(.ADDR_WIDTH(9)) videx_vram_cpu (
+        .clk(a2bus_if.clk_logic),
+        .write_addr(vram_word_addr),
+        .write_data(vram_wdata),
+        .write_enable(vram_we),
+        .byte_enable(vram_be),
+        .read_addr(vram_word_addr),
+        .read_enable(cpu_vram_rd),
+        .read_data(vram_cpu_data)
+    );
 
     // CPU read byte extraction (registered byte select for pipeline alignment)
     reg [1:0] vram_byte_sel_r;
@@ -224,10 +227,10 @@ module videx_card #(
         vram_byte_sel_rr <= vram_byte_sel_r;
     end
 
-    wire [7:0] vram_read_byte = vram_byte_sel_rr == 2'd0 ? vram_cpu_data_rr[7:0] :
-                                vram_byte_sel_rr == 2'd1 ? vram_cpu_data_rr[15:8] :
-                                vram_byte_sel_rr == 2'd2 ? vram_cpu_data_rr[23:16] :
-                                                           vram_cpu_data_rr[31:24];
+    wire [7:0] vram_read_byte = vram_byte_sel_rr == 2'd0 ? vram_cpu_data[7:0] :
+                                vram_byte_sel_rr == 2'd1 ? vram_cpu_data[15:8] :
+                                vram_byte_sel_rr == 2'd2 ? vram_cpu_data[23:16] :
+                                                           vram_cpu_data[31:24];
 
     // ========================================================================
     // Read Response Signals
