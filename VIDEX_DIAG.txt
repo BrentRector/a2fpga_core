@@ -1,0 +1,207 @@
+VIDEX CARD DIAGNOSTIC — Applesoft BASIC
+========================================
+
+Type this at the ] prompt AFTER running PR#3 (80-col mode active).
+Each test prints its number, delays ~0.5s, then performs the operation.
+If system crashes, the last visible number identifies the failing operation.
+
+---------- CUT HERE — TYPE THIS IN ----------
+
+5  FOR B = 0 TO 3:X = PEEK (49328 + B * 4): FOR J = 0 TO 511: POKE 52224 + J,32: NEXT J,B
+10  HOME : PRINT "VIDEX DIAG V2.0"
+20  D = 300: REM DELAY ITERATIONS
+100  PRINT "T01 CRTC STAT RD: ";: GOSUB 950:X = PEEK (49328): PRINT X;: IF X = 0 THEN PRINT " OK": GOTO 200
+110  PRINT " FAIL(EXP 0)"
+200  PRINT "T02 CRTC R14:  ";: GOSUB 950: POKE 49328,14:X = PEEK (49329): PRINT X;" OK"
+300  PRINT "T03 CRTC R15:  ";: GOSUB 950: POKE 49328,15:X = PEEK (49329): PRINT X;" OK"
+400  PRINT "T04 R0 RD(W0): ";: GOSUB 950: POKE 49328,0:X = PEEK (49329): PRINT X;: IF X <> 192 THEN PRINT " OK": GOTO 500
+410  PRINT " FAIL(OPEN BUS)"
+500  PRINT "T05 R12 RD(W0):";: GOSUB 950: POKE 49328,12:X = PEEK (49329): PRINT X;: IF X <> 192 THEN PRINT " OK": GOTO 600
+510  PRINT " FAIL(OPEN BUS)"
+600  PRINT "T06 R13 RD(W0):";: GOSUB 950: POKE 49328,13:X = PEEK (49329): PRINT X;: IF X <> 192 THEN PRINT " OK": GOTO 700
+610  PRINT " FAIL(OPEN BUS)"
+700  PRINT "T07 SLOT ROM:  ";: GOSUB 950:X = PEEK (49920): PRINT X;: IF X = 44 THEN PRINT " OK": GOTO 800
+710  PRINT " FAIL(EXP 44)"
+800  PRINT "T08 EXP ROM:   ";: GOSUB 950:X = PEEK (51200): PRINT X;: IF X = 173 THEN PRINT " OK": GOTO 1000
+810  PRINT " FAIL(EXP 173)"
+820  GOTO 1000
+920  RETURN
+950  FOR I = 1 TO D: NEXT : RETURN
+1000  PRINT "T09 VRAM WR/RD:  ";: GOSUB 950:X = PEEK (49340): POKE 52672,170:X = PEEK (52672): PRINT X;: IF X = 170 THEN PRINT " OK": GOTO 1100
+1010  PRINT " FAIL(EXP 170)"
+1100  PRINT "T10 VRAM BYTE2:  ";: GOSUB 950:X = PEEK (49340): POKE 52673,85:X = PEEK (52673): PRINT X;: IF X = 85 THEN PRINT " OK": GOTO 1200
+1110  PRINT " FAIL(EXP 85)"
+1200  PRINT "T11 CFFF+REENT:  ";: GOSUB 950:X = PEEK (53247):X = PEEK (49920):X = PEEK (51200): PRINT X;: IF X = 173 THEN PRINT " OK": GOTO 1300
+1210  PRINT " FAIL(EXP 173)"
+1300  PRINT "T12 VRAM POST:  ";: GOSUB 950:X = PEEK (49340):X = PEEK (52672): PRINT X;: IF X = 170 THEN PRINT " OK": GOTO 1400
+1310  PRINT " FAIL(EXP 170)"
+1400  PRINT "T13 R14,15:    ";: GOSUB 950: POKE 49328,14: POKE 49329,42: POKE 49328,15: POKE 49329,99
+1410  POKE 49328,14:A = PEEK (49329): POKE 49328,15:B = PEEK (49329)
+1420  PRINT A;",";B;: IF A = 42 AND B = 99 THEN PRINT " OK": GOTO 1500
+1430  PRINT " FAIL(EXP 42,99)"
+1500  PRINT "T14 BANK SWITCH:";: GOSUB 950
+1510  X = PEEK (49328): POKE 52672,170: REM BK0
+1515  X = PEEK (49332): POKE 52672,51: REM BK1
+1520  X = PEEK (49336): POKE 52672,204: REM BK2
+1525  X = PEEK (49340): POKE 52672,85: REM BK3
+1530  A = PEEK (52672): REM READ BK3
+1535  X = PEEK (49328):B = PEEK (52672): REM READ BK0
+1540  PRINT A;",";B;: IF A = 85 AND B = 170 THEN PRINT " OK": GOTO 1600
+1550  PRINT " FAIL(EXP 85,170)"
+1600  PRINT "T15 VRAM FILL:  ";: GOSUB 950
+1610  X = PEEK (49340): REM BANK 3
+1620  FOR J = 0 TO 255: POKE 52224 + J,J: NEXT
+1630  E = 0: FOR J = 0 TO 255: IF PEEK (52224 + J) <> J THEN E = E + 1
+1640  NEXT : PRINT E;" ERRS";: IF E = 0 THEN PRINT " OK": GOTO 1700
+1650  PRINT " FAIL"
+1700  PRINT "T16 VRAM STRESS:";: GOSUB 950
+1710  X = PEEK (49340):E = 0: REM BANK 3
+1720  FOR J = 1 TO 50: FOR K = 0 TO 255
+1730  POKE 52224 + K,K: IF PEEK (52224 + K) <> K THEN E = E + 1
+1740  NEXT K,J
+1750  PRINT E;" ERRS";: IF E = 0 THEN PRINT " OK": GOTO 1800
+1760  PRINT " FAIL"
+1800  PRINT "T17 NO DIAG:   ";: GOSUB 950
+1810  POKE 49328,14: POKE 49329,85: REM WRITE 85 TO R14
+1820  POKE 49328,0: REM SELECT R0 (WRITE ONLY)
+1830  X = PEEK (49329): REM READ DATA REG
+1840  PRINT X;: IF X = 85 THEN PRINT " FAIL:LEAK(R14)": GOTO 2000
+1850  IF X = 192 THEN PRINT " FAIL:OPEN BUS": GOTO 2000
+1860  PRINT " OK(REG)"
+2000  PRINT "T18 SLOT DESEL:  ";: GOSUB 950
+2010  X = PEEK (49920): REM $C300 ENSURE VIDEX
+2020  X = PEEK (49664): REM $C200 SWITCH SLOT 2
+2030  A = PEEK (51200): REM $C800 SHOULD NOT BE VIDEX
+2040  X = PEEK (49920): REM $C300 RE-ENTER VIDEX
+2050  B = PEEK (51200): REM $C800 SHOULD BE VIDEX
+2060  PRINT A;",";B;: IF A <> 173 AND B = 173 THEN PRINT " OK": GOTO 2100
+2070  PRINT " FAIL"
+2100  PRINT "T19 CFFF CLEAR:  ";: GOSUB 950
+2110  X = PEEK (49920): REM $C300 ENSURE VIDEX
+2120  X = PEEK (53247): REM $CFFF CLEAR OWNERSHIP
+2130  A = PEEK (51200): REM $C800 SHOULD NOT BE VIDEX
+2140  X = PEEK (49920): REM $C300 RE-ENTER VIDEX
+2150  B = PEEK (51200): REM $C800 SHOULD BE VIDEX
+2160  PRINT A;",";B;: IF A <> 173 AND B = 173 THEN PRINT " OK": GOTO 2200
+2170  PRINT " FAIL"
+2200  PRINT "T20 VRAM ISOL:   ";: GOSUB 950
+2210  X = PEEK (49920): REM $C300 ENSURE VIDEX
+2220  X = PEEK (49340): POKE 52672,123:A = PEEK (52672): REM BK3 WRITE+VERIFY
+2230  X = PEEK (49664): REM $C200 SWITCH SLOT 2
+2240  B = PEEK (52672): REM VRAM SHOULD NOT RESPOND
+2250  X = PEEK (49920): REM $C300 RE-ENTER VIDEX
+2260  X = PEEK (49340):C = PEEK (52672): REM BK3 VRAM SHOULD BE 123
+2270  PRINT A;",";B;",";C;: IF A = 123 AND B <> 123 AND C = 123 THEN PRINT " OK": GOTO 2300
+2280  PRINT " FAIL"
+2300  PRINT "T21 MULTI-SLOT:  ";: GOSUB 950
+2310  X = PEEK (49920):X = PEEK (49340): POKE 52672,77: REM $C300 BK3 WRITE
+2320  X = PEEK (49664): REM $C200 SLOT 2
+2330  X = PEEK (50176): REM $C400 SLOT 4
+2340  X = PEEK (49920): REM $C300 BACK TO VIDEX
+2350  A = PEEK (51200):X = PEEK (49340):B = PEEK (52672): REM ROM + BK3 VRAM
+2360  PRINT A;",";B;: IF A = 173 AND B = 77 THEN PRINT " OK": GOTO 2400
+2370  PRINT " FAIL"
+2400  POKE 49328,14: POKE 49329,0: POKE 49328,15: POKE 49329,0
+2410  X = PEEK (49328): PRINT : PRINT "ALL TESTS DONE"
+2420  END
+
+---------- END ----------
+
+EXPECTED OUTPUT (A2FPGA with HD6845SP Type 1 read-back):
+T01 CRTC STAT RD:  0 OK
+T02 CRTC R14:  <value> OK
+T03 CRTC R15:  <value> OK
+T04 R0 RD(W0):  <value> OK          (Type 1: returns written value, not open bus)
+T05 R12 RD(W0): <value> OK          (Type 1: returns written value, not open bus)
+T06 R13 RD(W0): <value> OK          (Type 1: returns written value, not open bus)
+T07 SLOT ROM:   44 OK
+T08 EXP ROM:    173 OK
+T09 VRAM WR/RD:   170 OK
+T10 VRAM BYTE2:   85 OK
+T11 CFFF+REENT:   173 OK
+T12 VRAM POST:    170 OK
+T13 R14,15:     42,99 OK
+T14 BANK SWITCH: 85,170 OK
+T15 VRAM FILL:   0 ERRS OK
+T16 VRAM STRESS: 0 ERRS OK
+T17 NO DIAG:    <value> OK(REG)     (Type 1: R0 returns written value, not 0 or 85)
+T18 SLOT DESEL:  <not173>,173 OK
+T19 CFFF CLEAR:  <not173>,173 OK
+T20 VRAM ISOL:   123,<not123>,123 OK
+T21 MULTI-SLOT:  173,77 OK
+
+ALL TESTS DONE
+
+ADDRESS REFERENCE:
+- 49328 ($C0B0) = CRTC address reg / Bank 0 select
+- 49329 ($C0B1) = CRTC data reg
+- 49332 ($C0B4) = Bank 1 select
+- 49336 ($C0B8) = Bank 2 select
+- 49340 ($C0BC) = Bank 3 select
+- 49664 ($C200) = Slot 2 ROM (SSC)
+- 49920 ($C300) = Slot 3 ROM (Videx)
+- 50176 ($C400) = Slot 4 ROM
+- 51200 ($C800) = Expansion ROM
+- 52224 ($CC00) = VRAM window start
+- 52672 ($CDC0) = VRAM window + $1C0
+- 52673 ($CDC1) = VRAM window + $1C1
+- 53247 ($CFFF) = Expansion ROM disable
+
+NOTES:
+- Line 5: Initializes all 4 VRAM banks to spaces (32/$20) before tests.
+- T01: Even address ($C0B0) read = status register. MC6845 Type 0
+  has no status, so should return 0.
+- T02/T03: R14/R15 are readable. Values depend on cursor position.
+- T04-T06: Tests that card drives the bus for "write-only" registers.
+  HD6845SP Type 1 returns written values for all R0-R15.
+  Test checks value != 192 ($C0 = open bus). Any other value = OK.
+- T07: Slot 3 ROM byte at $C300 should be $2C (44).
+- T08: Expansion ROM byte at $C800 should be $AD (173).
+- T09-T10: VRAM write/read at $CDC0/$CDC1, bank 3.
+- T11: $CFFF clears expansion ROM ownership, $C300 re-enters,
+  $C800 should return Videx ROM again.
+- T12: After CFFF+reenter cycle, VRAM data from T09 should survive.
+  Re-selects bank 3 before reading.
+- T13: Full R14/R15 write + read-back verification.
+- T14: 4-bank switch isolation. Writes distinct patterns ($AA, $33,
+  $CC, $55) to all 4 banks at $CDC0, verifies banks 0 and 3
+  retained their values. Bank addresses: $C0B0(0), $C0B4(1),
+  $C0B8(2), $C0BC(3).
+- T15: Sequential VRAM fill/verify (256 bytes starting at $CC00, bank 3).
+- T16: VRAM stress test (write+immediate read, 50 iterations x 256 bytes).
+  Tests for VRAM read pipeline collisions with the video scanner.
+- T17: Register isolation diagnostic. Writes 85 to R14, then selects R0
+  and reads data register. Three outcomes: 85=FAIL:LEAK (R14 value leaked
+  through index switch), 192=FAIL:OPEN BUS (no card responding),
+  any other value=OK(REG) (card correctly returns R0's own value).
+- T18: Slot deselection test. Accesses $C200 (slot 2) which should cause
+  Videx to release C8 ownership. Then reads $C800 — Videx should NOT
+  respond. Re-enters $C300, verifies $C800 returns Videx ROM again.
+  SSC uses SLOTROM guard (checks SLOTROM==2 at read time). Videx uses
+  self-clearing c8_owned (clears on other-slot $Csxx access).
+- T19: $CFFF ownership clearing WITHOUT immediate re-entry. Unlike T11
+  which clears and immediately re-enters, this verifies the intermediate
+  state: after $CFFF, $C800 must NOT return Videx ROM (rom_ownership=0).
+- T20: VRAM isolation across slot switch. Writes to VRAM on bank 3,
+  switches to slot 2, verifies VRAM is NOT readable (rom_c8_active=0
+  blocks VRAM window), switches back, verifies VRAM data survived.
+- T21: Multi-slot scan simulation (like Pascal device scanning). Accesses
+  slot 3, then slot 2, then slot 4, then back to slot 3. Verifies both
+  ROM and VRAM are accessible after the round trip.
+
+IF CRASH AT SPECIFIC TEST:
+- T01-T06: CRTC read logic issue
+- T07: Slot ROM / io_select_n issue
+- T08: Expansion ROM / rom_ownership issue
+- T09-T10: VRAM write or read pipeline issue
+- T11-T12: $CFFF / rom_ownership clearing/re-entering issue
+- T13: CRTC write/read-back issue
+- T14: Bank selection side-effect issue
+- T15-T16: VRAM timing / scanner collision issue
+- T17: CRTC register read-back leak
+- T18: SLOTROM guard missing — Videx responds to C8 reads when
+  another slot is active
+- T19: rom_ownership not clearing on $CFFF, or re-entry not working
+- T20: VRAM accessible when it shouldn't be (rom_c8_active not gating
+  VRAM window), or VRAM data lost during slot switch
+- T21: ROM/VRAM not surviving a multi-slot round trip (Pascal scan issue)

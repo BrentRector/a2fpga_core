@@ -243,6 +243,16 @@ module top #(
         .vgc_data_o(vgc_data_w)
     );
 
+    // Videx not supported on this board
+    assign a2mem_if.VIDEX_MODE = 1'b0;
+    assign a2mem_if.VIDEX_CRTC_R9  = 8'h0;
+    assign a2mem_if.VIDEX_CRTC_R10 = 8'h0;
+    assign a2mem_if.VIDEX_CRTC_R11 = 8'h0;
+    assign a2mem_if.VIDEX_CRTC_R12 = 8'h0;
+    assign a2mem_if.VIDEX_CRTC_R13 = 8'h0;
+    assign a2mem_if.VIDEX_CRTC_R14 = 8'h0;
+    assign a2mem_if.VIDEX_CRTC_R15 = 8'h0;
+
     // Slots
 
     slot_if slot_if();
@@ -288,7 +298,9 @@ module top #(
     wire [7:0] apple_vga_g;
     wire [7:0] apple_vga_b;
 
-    apple_video apple_video (
+    apple_video #(
+        .VIDEX_SUPPORT(0)
+    ) apple_video (
         .a2bus_if(a2bus_if),
         .a2mem_if(a2mem_if),
 
@@ -301,6 +313,10 @@ module top #(
         .video_bank_o(video_bank_w),
         .video_rd_o(video_rd_w),
         .video_data_i(video_data_w),
+
+        .videx_vram_addr_o(),
+        .videx_vram_rd_o(),
+        .videx_vram_data_i(32'b0),
 
         .video_active_o(apple_vga_active),
         .video_r_o(apple_vga_r),
