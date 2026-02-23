@@ -321,14 +321,13 @@ module videx_card #(
     // the INTC8ROM bug. This would add INTC8ROM protection for IIe support.
     wire exp_rom_read  = rom_c8_active && a2bus_if.phi0 && exp_rom_range && a2bus_if.rw_n;
 
-    // VRAM CPU read-back disabled: real Videx (HD6845SP) and A2DVI both
-    // return open bus for $CC00-$CDFF reads. Only scanner reads VRAM.
-    // wire vram_read  = rom_c8_active && a2bus_if.phi0 && vram_window && a2bus_if.rw_n;
+    wire vram_read = rom_c8_active && a2bus_if.phi0 && vram_window && a2bus_if.rw_n;
 
-    assign rd_en_o = card_enable && (crtc_read || slot_rom_read || exp_rom_read);
+    assign rd_en_o = card_enable && (crtc_read || slot_rom_read || exp_rom_read || vram_read);
 
-    // data_o mux: CRTC (combinational) > ROM (registered)
-    assign data_o = crtc_read    ? crtc_data :
+    // data_o mux: CRTC (combinational) > VRAM (registered) > ROM (registered)
+    assign data_o = crtc_read ? crtc_data :
+                    vram_read ? vram_read_byte :
                     rom_data_rr;
 
 endmodule
