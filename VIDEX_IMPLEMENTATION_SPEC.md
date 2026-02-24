@@ -150,7 +150,7 @@ wire [7:0] crtc_data = (a2bus_if.addr[0] && crtc_idx < 5'd16)
                      ? crtc_regs[crtc_idx] : 8'h00;
 ```
 
-**HD6845SP Type 1 vs. MC6845 Type 0**: The original MC6845 (Type 0) makes only R14/R15 readable. The HD6845SP (Hitachi, Type 1) — the chip used in physical Videx cards — returns written values for all R0–R15. The A2FPGA implementation follows Type 1 behavior. Physical HD6845SP has a quirk where R12 reads as 63 and R13 reads as 60 (partial state leakage, not the written value), but the implementation returns the exact written value for all registers, matching A2DVI behavior.
+**HD6845SP Type 1 vs. MC6845 Type 0**: The original MC6845 (Type 0) makes only R14/R15 readable. The HD6845SP (Hitachi, Type 1) — the chip used in physical Videx cards — returns written values for all R0–R15. The A2FPGA implementation follows Type 1 behavior. Physical HD6845SP has a quirk where R12 reads as 63 and R13 reads as 60 (partial state leakage, not the written value), but the implementation returns the exact written value for all registers.
 
 **Why read-back matters**: The Videx ROM itself never reads CRTC registers. However, third-party detection software and diagnostic tools write test values to various registers, then read them back. VIDEX_DIAG tests T02–T06, T13, and T17 all verify CRTC read-back behavior.
 
@@ -2496,7 +2496,7 @@ Same fix applied to SSC (`ENA_C8S` with `SLOTROM == 3'd2` guard, commit 880a976)
 ```systemverilog
 wire crtc_read = card_dev_sel && a2bus_if.rw_n;  // no crtc_readable gate
 ```
-All R0–R15 return their written values (HD6845SP Type 1 behavior, matching A2DVI). Non-existent registers (R16+) and even-address reads return `$00`.
+All R0–R15 return their written values (HD6845SP Type 1 behavior). Non-existent registers (R16+) and even-address reads return `$00`.
 
 ### 23.6 INTC8ROM Clearing on Non-C3 Slot Access
 
@@ -2561,235 +2561,30 @@ assign a2_bridge_bus_d_oe_n_o = ~(data_out_en_i & BUS_DATA_OUT_ENABLE & ~oe_earl
 
 ## 24. Resolved: Pascal Boot Hang
 
-### 24.1 Symptom
+Apple Pascal 1.3 initially hung during boot with the Videx card enabled. Multiple root causes were found and fixed:
 
-After all 21 BASIC diagnostic tests pass, the CardCat utility (a Pascal application) hangs during the Pascal OS boot sequence. The 80-col cursor appears (Videx INIT succeeds, CRTC programmed) but the cursor never moves down one row (which is the first thing that should happen after initialization). The hang occurs during Pascal's device/storage scanning phase — before CardCat's own code runs.
+### 24.1 Root Causes and Fixes
 
-### 24.2 Hardware Configuration
+| Root Cause | Fix | Reference |
+|------------|-----|-----------|
+| `cfff_access` not phi0-qualified — address bus transients during phi1 spuriously cleared `c8_owned` → open bus → non-deterministic crashes | phi0 qualification: `wire cfff_access = a2bus_if.phi0 && (addr == 16'hCFFF)` | §23.9 |
+| SSC `C8S2` not phi0-qualified — PCB bus transceiver glitches (from Videx rd_en_o transitions) caused SSC expansion ROM ownership to clear mid-execution | phi0 gate on entire C8S2 case block in `super_serial_card.sv` | §23.9 |
+| INTC8ROM permanently set on Apple ][+ — blocked io_strobe_n for ALL slot 3 cards | `is_iie` runtime detection gates INTC8ROM (Apple IIe only) | §23.8 |
+| CPLD bus transceiver OE held ~100ns into phi1 — I/O writes from C8-space created bus contention that corrupted disk I/O | Phase-counter OE cutoff in `apple_bus.sv` releases OE ~37ns after real phi0 drops | §23.11 |
 
-| Slot | Card | Type | Card ID |
-|------|------|------|---------|
-| 0 | RamX (128K+) | Physical | 0 (disabled) |
-| 1 | (empty) | — | 0 (disabled) |
-| 2 | Super Serial Card | FPGA | 3 |
-| 3 | Videx VideoTerm | FPGA | 5 |
-| 4 | Mockingboard | FPGA | 2 |
-| 5 | (disabled — was card_id=4, no matching module) | — | 0 (disabled) |
-| 6 | Disk II controller | Physical | 0 (disabled) |
-| 7 | SuperSprite | FPGA | 1 |
+### 24.2 Key Observations
 
-**Note**: Slot 5 was previously `card_id=4` (orphaned Disk II emulator), now disabled (`card_id=0`). Slot 6 is the physical Disk II controller.
+- All 21 BASIC diagnostic tests passed even before Pascal fixes — the bugs only manifested during Pascal's multi-card boot sequence where FINIT is called for every detected firmware card
+- Shadow mode (rd_en_o=0, rom_en_o=0) confirmed the rendering pipeline was correct — the problem was exclusively in bus response timing
+- Systematic ROM patching proved the failure mechanism: I/O writes (`$C0xx`) from C8 space broke disk loading, while RAM writes (`$0400`) from C8 space worked fine — pointing to CPLD OE timing as the root cause
 
-### 24.3 What Works
+### 24.3 Pascal Detection Protocol
 
-- All 21 BASIC diagnostic tests pass on A2FPGA (CRTC reads, ROM, VRAM, bank switch, SLOTROM guards, $CFFF, multi-slot isolation)
-- Disk II works fine with 80-col mode in BASIC (after PR#3)
-- Videx INIT succeeds during Pascal boot (80-col cursor appears)
-- A2DVI v4.4 Videx emulation works with Pascal/CardCat (confirmed on HDMI)
-- Physical Videx card (HD6845SP): no crash/reboot with Pascal, but 80-col output not verifiable (composite only)
-- Both the physical Videx and A2DVI **fail** many VIDEX_DIAG tests (see §25)
+Apple Pascal 1.1–1.3 all use the same UCSD p-System Interpreter II nucleus. Pascal detects Videx as **type 6 (firmware)** based on ROM bytes at offsets 5=$38, 7=$18, 11=$01, routing all console I/O through the Pascal firmware protocol (WFIRM/RFIRM/FINIT). The emulated SSC in slot 2 has identical detection bytes, so Pascal calls FINIT for both cards.
 
-### 24.4 Eliminated Causes
+### 24.4 Status
 
-| Hypothesis | Status | Evidence |
-|------------|--------|----------|
-| Stale `c8_owned` after Pascal INIT | **Fixed** | Self-clearing c8_owned (§3), T18–T21 pass |
-| SLOTROM guard approach | **Abandoned** | Both a2mem_if.SLOTROM and raw address decode cause PR#3 to hang. Replaced by self-clearing c8_owned (§3, §26). |
-| Open bus on CRTC reads (R12/R13) | **Fixed** | All device-select reads return `$00` or register value (§4.3), T04–T06 pass |
-| INTC8ROM blocking io_strobe_n | **Fixed** | is_iie detection gates INTC8ROM on ][+ (§6.6.1) |
-| SuperSprite C8 ROM interference | **Eliminated** | SuperSprite has no C8 ROM, only device I/O |
-| io_strobe_n-based C8 gating | **Abandoned** | Causes PR#3 to hang even with is_iie fix. Card uses phi0 + c8_owned instead. |
-| phi0 bus contention glitch | **Eliminated** | All `rd_en_o` paths properly phi0-qualified |
-| CRTC Type 0 vs Type 1 register reads | **Fixed but insufficient** | Changed to Type 1 (all R0–R15 readable). Real HD6845SP confirmed as Type 1. Did not fix hang. |
-| CRTC even-address read returning crtc_idx | **Reverted** | Physical Videx returns $00 for even-address reads (T01). Change was wrong. |
-| Orphaned slot 5 Disk II emulator | **Fixed** | Disabled (card_id=0). Was card_id=4 with no matching module. |
-| Videx disabled entirely | **Confirmed cause** | Setting slot 3 to `00` in `slots.hex`: Pascal detects SSC in CardCat. Confirms Videx card causes the hang. |
-| A2DVI comparison | **Confirmed** | A2DVI in slot 3 + A2FPGA in slot 7: Pascal/CardCat works perfectly. Proves SSC/MB/SuperSprite are clean. |
-| Shadow mode (rd_en_o=0, rom_en_o=0) | **Confirmed** | Pascal works in shadow mode with both physical Videx and A2DVI rendering. Problem is in read responses, not rendering. |
-
-### 24.4.1 Pascal Version and Protocol
-
-Apple Pascal 1.1, 1.2, and 1.3 all ship with the same UCSD p-System Interpreter II nucleus — same BIOS, same slot-scan code, same soft-switch patterns. The v1.1 Willi Kusche listing applies directly to v1.3.
-
-Pascal detects Videx as **type 6 (firmware)** based on ROM bytes at offsets 5=$38, 7=$18, 11=$01. This causes Pascal to route all console I/O through the Pascal firmware protocol (WFIRM/RFIRM/FINIT), not the generic serial path. The emulated SSC in slot 2 has identical detection bytes, so Pascal also calls FINIT for slot 2.
-
-### 24.4.2 Binary Search Results (updated)
-
-| Test | Change | Pascal result |
-|------|--------|---------------|
-| Baseline (pre-fix) | All reads enabled, `cfff_access` unqualified | Non-deterministic: cursor at ~40 chars, v1.3 error, spontaneous reboots |
-| Test B | `exp_rom_read = 0` | PR#3 hangs — firmware can't execute from $C800. Infinite reboot. |
-| Test C | `vram_read = 0` | Never switches to 80-col. "SYSTEM.PASCAL IS NOT V1.3" on 80-col |
-| Test D | `vram_read ? 8'hFF` | Non-deterministic reboots + occasional progress. Abandoned — see §24.5.2 |
-| **cfff_access phi0 fix** | `wire cfff_access = phi0 && (addr == $CFFF)` | **100% deterministic**: 80-col, blinking cursor at (0,0), blank screen |
-
-**Key comparison** — what each platform serves on the bus:
-
-| Read type | Physical Videx (works) | A2DVI (works) | A2FPGA (hangs) |
-|-----------|----------------------|---------------|----------------|
-| Slot ROM ($C3xx) | Yes | Yes | Yes |
-| CRTC ($C0Bx) | Yes | Yes | Yes |
-| Exp ROM ($C800-$CBFF) | Not under VIDEX_DIAG (T08=$FF) | No | Yes |
-| VRAM ($CC00-$CDFF) | Not under VIDEX_DIAG (T09+fail) | No | Yes |
-
-**Important distinction**: Physical Videx and A2DVI "not serving VRAM reads" means they simply do not drive the bus (open bus). This is NOT equivalent to actively driving $FF (Test D), which changes internal FPGA state (cpu_hold, data_o mux) in ways real hardware never does. Test D is toxic for this reason and has been abandoned.
-
-**Disk II has no C8 ROM** — eliminates any hypothesis involving Disk II expansion ROM interference.
-
-### 24.5 Root Cause Found: `cfff_access` Not phi0-Qualified
-
-**ROOT CAUSE OF NON-DETERMINISM**: `cfff_access` in `videx_card.sv` was not phi0-qualified:
-
-```sv
-// Bug:
-wire cfff_access = (a2bus_if.addr == 16'hCFFF);
-
-// Fix:
-wire cfff_access = a2bus_if.phi0 && (a2bus_if.addr == 16'hCFFF);
-```
-
-The adjacent `other_slot_rom` signal has an explicit comment: "phi0-qualified to avoid transient address matches during phi1." `cfff_access` was missing the same protection. During address bus transitions between cycles (e.g., `$C33x` → `$C8xx`), the registered address briefly passes through `$CFFF`, firing on the fast `clk_logic` clock and spuriously clearing `c8_owned`. With `c8_owned=0` and `SLOTROM=3` (not 2), neither the Videx card nor the emulated SSC drives `$C8xx` → open bus → 6502 executes `$FF` bytes → non-deterministic crash.
-
-**Fix applied**: 12/12 consecutive boots now give identical, deterministic behavior.
-
-### 24.5.1 Remaining Symptom After cfff_access Fix
-
-With the cfff_access fix applied (production code: `cfff_access` phi0-qualified, `vram_read ? vram_read_byte`):
-
-- **100% deterministic**: Apple ][ logo → 80-col switch → blinking cursor at (0,0) → hang
-- **VRAM is all spaces**: Shadow VRAM never received any writes from `PASCAL_WRITE`. Videx's `ENCODE_CHAR` → `STA $CC00,X` was never called.
-- **No keypress response**: Not yet determined whether CPU is in keyboard polling loop or crashed
-
-Cursor blinking at (0,0) is consistent with CRTC R10=$E0 (set by `INIT_CRTC_LOOP`) but does not confirm `CURSOR_UPDATE` was called. `CHORZ=0` means either (a) no `PASCAL_WRITE` calls advanced the cursor, or (b) only CR characters were output.
-
-### 24.5.2 Hypothesis: CSW Not Set to $C307 on Disk Boot
-
-On disk boot (PR#6), `SLOT_ENTRY` at `$C300` is never called. CSW (`$0036-$0037`) defaults to the Apple II 40-col output routine (`$FDF0`), NOT to the Videx `OUTPUT_ENTRY` at `$C307`.
-
-The Pascal BIOS `CWRITE` function for type 6 correctly calls `WFIRM` (Pascal firmware protocol) — this path does NOT use CSW and should write to Videx VRAM.
-
-However, if the Pascal p-machine uses `COUT` (Apple II system call) directly for any output — bypassing the BIOS — that output would go to the 40-col text screen (`$0400-$07FF`), invisible in 80-col mode. This would explain blank 80-col screen + no VRAM writes.
-
-**Diagnostic**: After Pascal hang, press Reset → BASIC → run:
-```basic
-FOR I = 1024 TO 1103: PRINT CHR$(PEEK(I) AND 127);: NEXT
-```
-- If non-space text appears: p-machine is outputting to 40-col via COUT/CSW. Pascal is running; keyboard may work but user cannot see the prompt.
-- If blank: p-machine crashed or hangs before any output.
-
-### 24.6 SSC Not Involved (Test B)
-
-Testing with SSC disabled (`slots.hex` slot 2 = 00) produced the same hang.
-Testing with ALL other cards disabled (`slots.hex` = `00 00 00 05 00 00 00 00`)
-also produced the same hang. The problem is 100% the Videx card driving the bus.
-
-~25% of Videx-only boots showed NO disk reads at all (hang before disk access
-begins), while ~75% showed the track 0 retry loop. This means Pascal sometimes
-hangs before reaching disk I/O.
-
-### 24.7 ROM Patch Binary Search (Tests F–M)
-
-Systematic ROM patching isolated the failure mechanism:
-
-| Test | $C800 code | Write target | Disk result |
-|------|-----------|-------------|-------------|
-| F | RTS (INIT=nothing) | — | tracks 0-25, hang after |
-| G | INIT+WRITE=RTS | — | **full boot, keyboard works** |
-| H | full INIT, WRITE=RTS | CRTC+VRAM+AN0+screen holes | 0,1,2,3,4,0 hang |
-| I | RTS (nothing) | — | all tracks, works |
-| J | STA $C059 only | soft switch | 0-4, hang |
-| K | full INIT minus AN0 | CRTC+VRAM+screen holes | 0,1,2,3,4,0 hang |
-| L | STA $0400 only | main RAM | all tracks, **works** |
-| M | CRTC R/W test | $C0B0/$C0B1 + $0400/$0401 | 2 reboots then all tracks |
-
-**Key findings:**
-
-1. **Test G**: Pascal fully boots when INIT and WRITE are both stubbed.
-   Keyboard works. READ's C8-space execution (keyboard polling at $C000) works
-   without issue. C8-space bus driving per se is NOT the problem.
-
-2. **Test J vs L**: A single `STA $C059` (I/O write) from C8 space breaks disk
-   loading. A single `STA $0400` (RAM write) from C8 space works fine. The
-   problem is specific to **I/O writes** ($C0xx) from C8 space.
-
-3. **Test K**: Removing AN0 from full INIT doesn't help — CRTC and VRAM writes
-   are equally problematic. Multiple I/O operations independently trigger failure.
-
-4. **Test M**: CRTC I/O writes are marginal — 2 spontaneous reboots then success.
-   This non-determinism suggests a narrow timing margin.
-
-**Conclusion**: The problem is bus transceiver timing during I/O write cycles that
-originate from C8-space instruction fetches. During an I/O write, the CPLD
-transceiver is still driving from the previous read cycle while the motherboard's
-I/O decode logic is processing the new write. The ~100ns OE overlap into phi1
-creates contention specifically with the I/O decode path.
-
-### 24.8 Bus Timing Analysis
-
-The CDC denoise pipeline delays phi0 by ~6 clk_logic cycles (~100ns at 54 MHz):
-- 2 synchronizer FFs
-- 3-bit debounce counter
-- 2-stage FIFO (phi0 = !fifo[1], phi1_posedge = fifo == 2'b01)
-
-**Critical timing fact**: `phi0` and `phi1_posedge` fire on the EXACT SAME
-`clk_logic` cycle — they are simultaneous, not sequential. This means
-phi1_posedge-based early deassert has zero effect.
-
-The phase counter (`phase_cycles_r`) resets on each CDC-delayed phi edge:
-- PHASE_COUNT = 26 (~481ns per half-cycle at 54 MHz)
-- WRITE_COUNT = 10: IO_WRITE_DATA triggers, samples card data
-- READ_COUNT = 17: IO_READ_DATA samples data from bus
-- OE_CUTOFF = 22: New early OE release point
-
-**Timeline during phi0 (read response cycle):**
-```
-Cycle 0:  CDC-delayed phi0 rises, phase counter resets
-Cycle 10: IO_WRITE_DATA triggers, latches card data to bridge
-Cycle 13: IO_WRITE_DATA completes
-Cycle 20: Estimated real phi0 drops (~370ns into half-cycle)
-Cycle 22: OE cutoff fires — bus transceiver released (OE_CUTOFF)
-Cycle 26: CDC-delayed phi0 drops — old behavior would release here
-```
-
-The OE cutoff eliminates ~75ns of unnecessary bus driving (cycles 22-26).
-
-**Why registering OE doesn't work**: Hardware-tested — the 1-cycle register delay
-extends CPLD drive INTO phi1, causing bus contention with the 6502 (which is
-already presenting the next address). Worse than the current ~100ns overlap.
-The combinational OE is correct; the fix is to cut it off using the phase counter.
-
-### 24.9 SSC vs Videx Bus Driving Comparison
-
-Detailed analysis of why SSC works with Pascal but Videx doesn't:
-
-| Aspect | SSC | Videx |
-|--------|-----|-------|
-| C8-space gating | `card_io_strobe` (INTC8ROM protection) | `rom_c8_active && phi0` (bypasses io_strobe_n) |
-| ROM data_o | Combinational (zero latency) | 2-cycle pipeline (37ns stale data) |
-| C8 ownership guard | `SLOTROM == 2` | Self-clearing `c8_owned` |
-| CFFF clearing | phi0-qualified (committed fix 880a976) | phi0-qualified (cfff_access fix) |
-| When FINIT runs | Runtime (after SYSTEM.PASCAL loads) | Boot (before disk I/O) |
-
-The SSC works because: (1) SSC FINIT runs at runtime, NOT during the critical
-boot sequence — by then, disk I/O is already initialized; (2) SSC ROM data is
-combinational with zero stale data; (3) SSC uses `card_io_strobe` with INTC8ROM
-protection. The Videx io_strobe_n bypass was necessary because INTC8ROM was
-permanently set on ][+ (now fixed by is_iie).
-
-### 24.10 Current Status
-
-| Issue | Status |
-|-------|--------|
-| Non-deterministic crashes (cfff_access) | **Fixed** — phi0 qualification |
-| SSC C8S2 spurious clearing | **Fixed** — phi0 qualification (880a976) |
-| INTC8ROM permanently set on ][+ | **Fixed** — is_iie detection |
-| I/O writes from C8 space break disk | **Fixed** — OE cutoff verified, Pascal boots 100% |
-| VRAM read-back | **Active** — re-enabled after OE cutoff fix resolved root cause |
-| Blinking cursor with no text | **Resolved** — was caused by disk I/O failure before console output |
-| PASCAL_WRITE never called | **Resolved** — p-machine was stuck in disk retry loop |
-
-**Status**: All issues resolved. Pascal 1.3 boots 100% with all emulated cards enabled
-(Videx + SSC + Mockingboard + SuperSprite). OE_MARGIN=2 confirmed correct.
+All issues resolved. Pascal 1.3 boots 100% with all emulated cards enabled (Videx + SSC + Mockingboard + SuperSprite).
 
 ---
 
@@ -2832,7 +2627,7 @@ permanently set on ][+ (now fixed by is_iie).
 
 ### 25.3 Key Findings
 
-1. **Physical Videx fails T08–T16**: The real card does not serve expansion ROM or VRAM reads when accessed by VIDEX_DIAG's test pattern. T08 returns $FF (not valid ROM data), T09–T16 VRAM tests all fail. Pascal/CardCat status unknown (only composite output, no display available).
+1. **Physical Videx fails T08–T16**: The real card does not serve expansion ROM or VRAM reads when accessed by VIDEX_DIAG's test pattern. T08 returns $FF (not valid ROM data), T09–T16 VRAM tests all fail. Pascal works with the physical Videx (confirmed via shadow mode HDMI rendering).
 
 2. **A2DVI fails the same tests**: A2DVI returns open bus for expansion ROM and VRAM reads. Pascal/CardCat confirmed working on A2DVI's HDMI output.
 
@@ -2847,55 +2642,30 @@ permanently set on ][+ (now fixed by is_iie).
 
 6. **Physical Videx T05/T06**: R12 returns 63 ($3F), R13 returns 60 ($3C). These are neither 0 nor the previously written values. This may reflect partial read-back or internal CRTC state leaking through.
 
-### 25.4 Implication for Fix
+### 25.4 Analysis
 
-The physical Videx card appears to NOT respond to expansion ROM or VRAM reads when accessed outside of firmware execution context. VIDEX_DIAG runs from BASIC (not through the Videx firmware), so the card may require a specific activation state (e.g., firmware-initiated io_strobe_n handshake) that VIDEX_DIAG doesn't provide.
+The physical Videx and A2DVI both fail VIDEX_DIAG T08-T16 (expansion ROM and VRAM reads) yet work correctly with Pascal. The A2FPGA passes all tests and also works correctly with Pascal (after the bus timing fixes in §23). The test differences are unrelated to the Pascal hang — the A2FPGA's correct C8-space read responses are the desired behavior for full emulation fidelity.
 
-On real Apple ][+ hardware, io_strobe_n is the mechanism that enables expansion ROM reads. The Videx card likely only responds to C8-space reads when io_strobe_n is asserted by the Apple II's memory decode logic. Our FPGA card bypasses io_strobe_n (because INTC8ROM blocks it on ][+) and uses rom_c8_active instead.
-
-**Resolution**: The root cause of the Pascal hang was NOT over-responsiveness to C8-space reads (the A2FPGA correctly serves these). The actual root cause was CPLD bus transceiver OE timing: the CDC denoise pipeline delayed phi0 by ~100ns, causing the CPLD to continue driving the bus into phi1 during I/O write cycles from C8 space. This bus contention corrupted the motherboard's I/O decode logic, breaking subsequent disk I/O. The phase-counter OE cutoff fix (§23.11) resolves this by releasing OE ~37ns after real phi0 drops.
-
-The VIDEX_DIAG test differences (physical Videx / A2DVI failing T08-T16) remain an interesting observation but are not related to the Pascal hang. The A2FPGA's correct C8-space read responses are actually the desired behavior for full emulation fidelity.
+The physical Videx card's failure to respond to VIDEX_DIAG's C8-space reads likely reflects the real Apple ][+ io_strobe_n mechanism. VIDEX_DIAG accesses C8-space from BASIC without the firmware-initiated io_strobe_n handshake that normal firmware execution provides. The A2FPGA uses phi0-qualified `rom_c8_active` instead of io_strobe_n (see §3, §26).
 
 ---
 
-## 26. C8 Ownership Debugging Results
+## 26. C8 Ownership Design Rationale
 
-### 26.1 Test Matrix
+### 26.1 Why Not SLOTROM Guard
 
-| Test | Ownership | C8 Guard | INTC8ROM | Result |
-|------|-----------|----------|----------|--------|
-| Baseline | card_io_sel only | None | Always 0 (hack) | VIDEX_DIAG pass, Pascal hang |
-| SLOTROM via a2mem_if | card_io_sel | a2mem_if.SLOTROM==3 | is_iie detection | PR#3 hangs |
-| SLOTROM + SSC pattern | Raw addr decode | a2mem_if.SLOTROM==3 | is_iie detection | PR#3 inconsistent: hangs cold boot, crashes/works after reset |
-| **Self-clearing c8_owned** | card_io_sel + clear on other $Csxx + $CFFF | **None (internal)** | is_iie detection | **VIDEX_DIAG T01-T20 pass, PR#3 works, Pascal works (with OE cutoff)** |
+The Videx card uses self-clearing `c8_owned` instead of a SLOTROM-based guard. SLOTROM-based approaches (both `a2mem_if.SLOTROM` and raw address decode) consistently caused PR#3 to hang. The probable cause is a timing mismatch: SLOTROM is updated on `phi1_posedge` in `apple_memory.sv`, but card signals use different clock qualifications (`phi0`, `card_io_sel`). The SLOTROM value may not be stable when the card evaluates `rom_c8_active` during the same bus cycle.
 
-### 26.2 Key Findings
+**Note**: The SSC's SLOTROM guard (`SLOTROM == 2`) has not been verified with actual SSC C8-space usage and may have the same timing issue.
 
-1. **SLOTROM guard consistently fails** regardless of how rom_ownership is acquired. Both the a2mem_if.SLOTROM signal and SSC-style raw address decode approaches result in PR#3 hanging or crashing.
+### 26.2 Current Approach
 
-2. **SSC's SLOTROM guard (upstream fix #1) has never been verified** with actual SSC C8-space usage. It was committed based on logical correctness but may have the same timing issue observed with the Videx card.
+Self-clearing `c8_owned`: the card monitors `$C1xx-$C7xx` directly (phi0-qualified) and clears `c8_owned` when any non-slot-3 `$Csxx` address is accessed. This implements the ownership protocol internally without depending on SLOTROM. `rom_c8_active = c8_owned && !INTCXROM`.
 
-3. **Probable timing mismatch**: SLOTROM is updated on phi1_posedge in apple_memory.sv, but card signals use different clock qualifications (phi0, card_io_sel, etc.). The SLOTROM value may not be stable when the card evaluates rom_c8_active during the same bus cycle.
+### 26.3 INTC8ROM Fix
 
-4. **Current approach (implemented and tested)**: Self-clearing `c8_owned`. The card monitors `$C1xx-$C7xx` directly (phi0-qualified) and clears `c8_owned` when any non-slot-3 `$Csxx` address is accessed. This removes all dependency on SLOTROM, implementing the ownership protocol internally. `rom_c8_active = c8_owned && !INTCXROM` (no SLOTROM guard). PR#3 works, VIDEX_DIAG T01-T20 pass. Pascal works with the additional OE cutoff fix (§23.11).
+The `is_iie` runtime detection is implemented and verified in `apple_memory.sv`. On Apple ][+, INTC8ROM remains 0 (never set), allowing io_strobe_n to fire normally for all slot 3 cards. On Apple IIe, INTC8ROM works correctly gated by SLOTC3ROM.
 
-### 26.3 INTC8ROM Fix Status
+### 26.4 phi0 Qualification
 
-The `is_iie` runtime detection approach is implemented and verified in apple_memory.sv. This gates the INTC8ROM logic so it only activates on Apple IIe systems, where it is needed for the internal 80-column firmware. On Apple ][+, INTC8ROM remains 0, allowing io_strobe_n to fire normally for all slot 3 cards.
-
-### 26.4 cfff_access Fix (Root Cause of Non-Determinism)
-
-The non-deterministic Pascal crashes were caused by `cfff_access` in `videx_card.sv` not being phi0-qualified. `other_slot_rom` in the same file already had phi0 qualification with an explicit "to avoid transient address matches during phi1" comment. `cfff_access` was missing the same protection.
-
-```sv
-// Before (bug):
-wire cfff_access   = (a2bus_if.addr == 16'hCFFF);
-
-// After (fix):
-wire cfff_access   = a2bus_if.phi0 && (a2bus_if.addr == 16'hCFFF);
-```
-
-During address bus transitions between bus cycles (e.g., expanding from `$C33x` slot ROM to `$C8xx` expansion ROM), the registered address briefly passes through intermediate values including `$CFFF`. At 100+ MHz `clk_logic`, even a single-cycle transient fires `cfff_access` and clears `c8_owned`. With `c8_owned=0` and `SLOTROM=3`, neither Videx nor the emulated SSC (which requires `SLOTROM==2`) drives `$C8xx` → 6502 reads open bus → executes `$FF` bytes → non-deterministic crash.
-
-**Result of fix**: 12/12 consecutive Pascal boots show identical deterministic behavior (80-col switch, blinking cursor at (0,0), blank screen). Non-determinism completely eliminated.
+All address-sensitive signals in the card (`cfff_access`, `other_slot_rom`, C8S2 in SSC) must be phi0-qualified to prevent address bus transients during phi1 from causing spurious state changes. At 54+ MHz `clk_logic`, even single-cycle transients during address transitions (e.g., `$C33x` → `$C8xx` passing through `$CFFF`) can fire unqualified comparators.

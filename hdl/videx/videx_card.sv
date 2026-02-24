@@ -41,7 +41,7 @@
 // The other-slot clearing prevents bus contention in the shared FPGA
 // bus mux (real hardware has per-slot bus transceivers).
 // C8 read responses are gated by phi0 directly (not io_strobe_n).
-// io_strobe_n-based gating causes PR#3 to hang (root cause TBD).
+// io_strobe_n-based gating causes PR#3 to hang (probable SLOTROM timing mismatch).
 //
 // Mode Switching:
 //
@@ -117,7 +117,7 @@ module videx_card #(
     // (e.g., accessing $C200 for SSC should stop Videx responding to $C800).
     //
     // Read responses are gated by phi0 directly. io_strobe_n-based gating
-    // was tried but causes PR#3 to hang (root cause TBD). The is_iie fix
+    // was tried but causes PR#3 to hang (probable SLOTROM timing mismatch). The is_iie fix
     // in apple_memory.sv keeps INTC8ROM=0 on ][+ for correct ownership.
 
     reg c8_owned;
