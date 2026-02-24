@@ -2,7 +2,7 @@
 
 ## Target: `videx_card.sv` for A2FPGA (Approach B)
 
-This specification defines every hardware behavior the virtual Videx card module must implement, derived from exhaustive analysis of the Videx VideoTerm ROM 2.4 firmware, MC6845 CRTC datasheet, and the existing A2FPGA passive shadow infrastructure.
+This specification defines every hardware behavior the virtual Videx card module implements, derived from exhaustive analysis of the Videx VideoTerm ROM 2.4 firmware, MC6845 CRTC datasheet, and physical Videx hardware testing.
 
 ---
 
@@ -228,11 +228,11 @@ The existing `VIDEX_LINE` renderer in `apple_video.sv` reads these via `a2mem_if
 
 R0–R8 define CRT timing that is irrelevant to HDMI rendering. They must be stored (for R14/R15 read-back indexing to work) but are not forwarded to the renderer.
 
-### 4.6 Feeding the Shadow
+### 4.6 Driving the Renderer
 
-The existing passive shadow in `apple_memory.sv` snoops bus writes to `$C0B0/$C0B1` and captures CRTC register values into its own `videx_crtc_regs[]` array. When the emulated card is active, the CPU still writes to `$C0B0/$C0B1` — these writes appear on the bus and the shadow captures them exactly as before. **No changes to the shadow CRTC capture logic are needed.**
+The card drives CRTC register values to the `VIDEX_LINE` rendering pipeline via `a2mem_if.videx` modport signals (`VIDEX_CRTC_R9` through `VIDEX_CRTC_R15`). These are assigned directly from the card's internal register array whenever register writes occur.
 
-The shadow also sets `videx_mode_r = 1` on the first observed CRTC write. This flag activates `VIDEX_LINE` rendering. It will trigger automatically when the Videx firmware initializes.
+`VIDEX_MODE` is driven by `card_enable` — the card is always "in mode" when configured in its slot. The `VIDEX_LINE` pipeline activates when `VIDEX_MODE && TEXT_MODE && AN0`.
 
 ---
 
@@ -280,9 +280,9 @@ When the CPU writes to `$CC00–$CDFF` and the expansion ROM ownership flag is s
 vram[{bank_sel, addr[8:0]}] <= data_in;
 ```
 
-The existing shadow in `apple_memory.sv` also captures this write into its own `videx_vram` BSRAM (same bus transaction, same data). The shadow's VRAM feeds the `VIDEX_LINE` renderer's read port. **No changes to the shadow VRAM write capture are needed.**
+The card's VRAM SDPB block has a 32-bit read port wired to the `VIDEX_LINE` rendering pipeline for scanner access (4 characters per read cycle).
 
-### 5.5 Read Path (New — Not in Shadow)
+### 5.5 Read Path
 
 When the CPU reads from `$CC00–$CDFF` and the expansion ROM ownership flag is set:
 
@@ -291,7 +291,7 @@ data_o <= vram[{bank_sel, addr[8:0]}];
 rd_en_o <= 1;
 ```
 
-This is the **critical gap** the card fills. The shadow's `sdpram32` read port is dedicated to the video scanner — it cannot serve CPU reads. The card maintains its own 2 KB VRAM copy specifically for read-back.
+The VRAM SDPB uses asymmetric port widths: 8-bit write for CPU access, 32-bit read for the scanner pipeline. CPU read-back uses a hold register and byte selection from the 32-bit read data.
 
 **Why VRAM reads matter**: The Videx ROM's CTRL-U "pick" function reads the character under the cursor from VRAM. Advanced programs (Apple Writer II, WordStar, VisiCalc) also read VRAM directly.
 
@@ -321,7 +321,7 @@ The read port is shared between the `VIDEX_LINE` scanner pipeline (via `videx_vr
 - **Scanner hold** (32-bit): captures 4-character word for `apple_video.sv`
 - **CPU hold** (32-bit): captures word, then byte-selected via `vram_addr[1:0]` pipeline
 
-The shadow VRAM in `apple_memory.sv` is no longer needed when the card is enabled.
+The previous shadow VRAM in `apple_memory.sv` has been removed. The card's VRAM is the sole copy.
 
 **Cost**: 1 SDPB block (2 KB).
 
@@ -340,9 +340,9 @@ The shadow VRAM in `apple_memory.sv` is no longer needed when the card is enable
 
 The slot ROM at `$C300–$C3FF` is the **same physical bytes** as `$CB00–$CBFF` in the expansion ROM. The ROM file is 1 KB; the slot ROM window reads from the last 256 bytes.
 
-### 6.2 BSRAM Allocation
+### 6.2 RAM Allocation
 
-The 1 KB ROM can be stored in a single BSRAM block (each GW2AR-18C BSRAM block is 2 KB). The unused half can be left empty or used for future expansion.
+The 1 KB ROM is annotated with `syn_ramstyle="distributed_ram"` to use LUTs instead of BSRAM. A 2-stage pipeline read is used for GoWin distributed RAM inference. GoWin may still place this in BSRAM depending on optimization context.
 
 Loaded from `videx_rom.hex` via `$readmemh`.
 
@@ -464,6 +464,17 @@ The card does **not** need to handle AN0 directly. The existing soft switch capt
 
 **Key detail**: The Videx firmware writes `STA $C059` on **every single character output** (`OUTPT1` at `$CA8F`), re-asserting AN0. This ensures the display stays in 80-column mode even if something else toggled AN0.
 
+### 7.1 Shadow Rendering Mode
+
+The card architecture supports a passive shadow rendering mode for use with a physical Videx VideoTerm card. In this configuration:
+
+- **Physical Videx** in slot 3 drives the Apple II bus (firmware ROM, CRTC, VRAM)
+- **A2FPGA** in another physical slot (typically slot 7) with the Videx card module configured for slot 3
+
+The FPGA card snoops all bus writes to slot 3 addresses — CRTC register writes (`$C0B0/$C0B1`), VRAM writes (`$CC00–$CDFF`), and soft switch accesses (`$C058/$C059`) — without driving the bus (`rd_en_o=0`, `rom_en_o=0`). The `VIDEX_LINE` pipeline renders the snooped data on HDMI output, providing a digital display for a physical Videx card that only has composite video output.
+
+This mode was used during development to verify the rendering pipeline independently from bus response logic. To enable shadow mode, disable the `rd_en_o` and `rom_en_o` assignments in `videx_card.sv`.
+
 ---
 
 ## 8. Screen Holes (Firmware State in Page-Hole RAM)
@@ -498,9 +509,7 @@ vram_byte = {FLAGS.bit0, ascii_char[6:0]}
 - Bit 7: 0 = normal, 1 = inverse (from FLAGS bit 0)
 - Bits [6:0]: ASCII character code (7-bit, e.g., `$41` = 'A')
 
-The character ROM is addressed as `{vram_byte[7:0], scanline[3:0]}` (12-bit address into 4 KB ROM):
-- `$000–$7FF`: 128 normal characters × 16 scanlines (vram bit 7 = 0)
-- `$800–$FFF`: 128 inverse characters × 16 scanlines (vram bit 7 = 1)
+The character ROM stores only 128 normal characters (2 KB). The ROM is addressed as `{vram_byte[6:0], scanline[3:0]}` (11-bit address into 2 KB ROM). Inverse characters (vram bit 7 = 1) are rendered by XOR-inverting the normal character's pixel data at capture time in the `VIDEX_LINE` pipeline, saving 1 BSRAM block.
 
 Only scanlines 0–8 are displayed (R9 = 8). Each character cell is 7 pixels wide. Scanlines 9–15 in the ROM are padding.
 
@@ -589,7 +598,7 @@ wire vram_window   = (a2bus_if.addr[15:9] == 7'b1100_110);    // $CC00-$CDFF
 wire exp_rom_range = (a2bus_if.addr[15:10] == 6'b110010);     // $C800-$CBFF
 ```
 
-**Writes** — captured on `phi1_posedge` using direct address decode (same timing as shadow):
+**Writes** — captured on `phi1_posedge` using direct address decode:
 
 ```
 // 1. Bank select — on ANY $C0Bx access (read or write)
@@ -642,9 +651,9 @@ if rom_c8_active && phi0 && exp_rom_range && rw_n:
 // rd_en_o = card_enable && (any of cases 6-9)
 ```
 
-### Shadow Interaction
+### Renderer Interface
 
-In the combined architecture, the card **directly drives** `a2mem_if.VIDEX_CRTC_R*` and `VIDEX_MODE` signals via the `a2mem_if.videx` modport. The shadow capture logic in `apple_memory.sv` has been removed (`videx_gen` block deleted). The card is the sole owner of all Videx state.
+The card **directly drives** `a2mem_if.VIDEX_CRTC_R*` and `VIDEX_MODE` signals via the `a2mem_if.videx` modport. The card is the sole owner of all Videx state. The scanner VRAM read port is wired directly to the `VIDEX_LINE` pipeline in `apple_video.sv`.
 
 ---
 
@@ -659,7 +668,7 @@ parameter bit VIDEX_CARD_ENABLE = 1,
 parameter bit [7:0] VIDEX_CARD_ID = 5,
 ```
 
-Couple `VIDEX_SUPPORT` with `VIDEX_CARD_ENABLE` — there is no standalone shadow mode:
+Couple `VIDEX_SUPPORT` with `VIDEX_CARD_ENABLE` — the rendering pipeline requires the card module:
 
 ```systemverilog
 apple_memory #(.VGC_MEMORY(1), .VIDEX_SUPPORT(VIDEX_CARD_ENABLE)) apple_memory (...);
@@ -719,9 +728,9 @@ The slotmaker module reads this file at initialization, configures slot 3 with c
 
 ---
 
-## 13. Rendering Path (Existing — No Changes)
+## 13. Rendering Path
 
-The `VIDEX_LINE` pipeline in `apple_video.sv` handles all rendering. No modifications are needed. Summary of what it does:
+The `VIDEX_LINE` pipeline in `apple_video.sv` handles all rendering. Summary of what it does:
 
 ### 13.1 Mode Activation
 
@@ -729,7 +738,7 @@ The `VIDEX_LINE` pipeline in `apple_video.sv` handles all rendering. No modifica
 wire line_type_w = (videx_mode_r & text_mode_r & an0_r) ? VIDEX_LINE : ...;
 ```
 
-`videx_mode_r` is set by the shadow on first CRTC write. `text_mode_r` and `an0_r` come from soft switches.
+`videx_mode_r` is driven by `a2mem_if.VIDEX_MODE`, which the card sets to `card_enable` (always active when configured). `text_mode_r` and `an0_r` come from soft switches.
 
 ### 13.2 Display Geometry
 
@@ -749,16 +758,23 @@ Where `text_base = {R12[2:0], R13[7:0]}`. This is the 11-bit circular buffer add
 ### 13.4 Character ROM Lookup
 
 ```
-rom_addr = {vram_byte[7:0], scanline[3:0]}   // 12-bit address into 4 KB ROM
+rom_addr = {vram_byte[6:0], scanline[3:0]}   // 11-bit address into 2 KB ROM
 pixel_data = videxrom[rom_addr]               // 8 bits, only lower 7 used
 ```
+
+The ROM stores only normal characters (0x00–0x7F). Inverse characters use the same ROM data with pixel inversion applied at capture (§13.5).
 
 ### 13.5 Cursor Rendering
 
 Cursor position: `{R14[2:0], R15[7:0]}` (11-bit VRAM address).
 Blink mode from R10[6:5]: `00`=always on, `01`=hidden, `10`=1/16 field rate, `11`=1/32 field rate.
 Scanline range: R10[3:0] (start) to R11[3:0] (end).
-Rendered as XOR `7'h7F` on the character's pixel data.
+
+Rendered by XOR combining the character's inverse flag (vram bit 7) with the cursor active flag:
+```
+pixel_out = rom_data[6:0] ^ {7{vram_byte[7] ^ cursor_active}}
+```
+This means: normal char + no cursor = normal pixels, inverse char + no cursor = inverted pixels, normal char + cursor = inverted pixels, inverse char + cursor = normal pixels (double inversion cancels).
 
 ---
 
@@ -768,7 +784,7 @@ Baseline (no Videx): 41/46 blocks used (89%), 5 free.
 
 | New Component | Type | BSRAM Blocks |
 |--------------|------|-------------|
-| Firmware ROM (1 KB) | pROM (distributed RAM annotation, but GoWin may use BSRAM) | 1 |
+| Firmware ROM (1 KB) | Distributed RAM (LUTs), annotated `syn_ramstyle="distributed_ram"` | 0–1 |
 | Character ROM (2 KB, halved from 4 KB) | pROM | 1 |
 | VRAM (2 KB, GoWin SDPB asymmetric 8-bit write / 32-bit read) | SDPB | 1 |
 | **Total Videx** | | **3** |
@@ -787,9 +803,9 @@ The character ROM halving (§9 — chars `$80–$FF` are inverse of `$00–$7F`,
 | `hdl/videx/videx_rom.hex` | **Exists** | Videx VideoTerm ROM 2.4 image (1 KB, hex format) — already created |
 | `boards/a2n20v2/hdl/top.sv` | **Modify** | Add `VIDEX_CARD_ENABLE`/`VIDEX_CARD_ID` params, instantiate card, wire to bus mux, couple `VIDEX_SUPPORT` with `VIDEX_CARD_ENABLE` |
 | `hdl/slots/slots.hex` | **Modify** | Assign Videx card ID 5 to slot 3 |
-| `hdl/memory/apple_memory.sv` | **No change** | Shadow capture continues to work as-is |
-| `hdl/video/apple_video.sv` | **No change** | VIDEX_LINE renderer continues to work as-is |
-| `hdl/memory/a2mem_if.sv` | **No change** | VIDEX signals already defined |
+| `hdl/memory/apple_memory.sv` | **Modify** | Add `is_iie` runtime detection, fix INTC8ROM logic for Apple ][+ |
+| `hdl/video/apple_video.sv` | **Modify** | Add `VIDEX_LINE` rendering pipeline with charrom halving (XOR inversion) |
+| `hdl/memory/a2mem_if.sv` | **Modify** | Add `videx` modport, VIDEX_MODE and VIDEX_CRTC_R9–R15 signals |
 
 ---
 
@@ -2201,30 +2217,24 @@ CBFF: EA           ; NOP (end of ROM)
 |----------|-------|
 | File | `hdl/video/videx_charrom.hex` (4096 lines, one hex byte per line) |
 | Format | `$readmemh` compatible |
-| Size | 4096 bytes (4 KB) |
-| Source | Generated by `tools/gen_videx_rom.py` from A2DVI firmware font data |
-| Upstream | ThorstenBr/A2DVI-Firmware: `firmware/fonts/videx/videx_normal.c` and `videx_inverse.c` |
-| Structure | Two halves: normal (2048 bytes) + inverse (2048 bytes) |
+| Size | 4096 bytes total; only first 2048 bytes (normal chars) loaded |
+| Source | Captured from a physical Videx VideoTerm adapter. Converted by `tools/gen_videx_rom.py`. |
+| Structure | Two halves: normal (2048 bytes) + inverse (2048 bytes). Only the first half is loaded into a 2048-entry ROM array; inverse chars are generated at runtime by XOR inversion (§13.5). |
 
 ### 21.2 Addressing
 
-The character ROM is addressed with a 12-bit address formed from the VRAM byte and scanline counter:
+The character ROM is addressed with an 11-bit address formed from the VRAM byte (lower 7 bits) and scanline counter:
 
 ```
-rom_addr[11:0] = {vram_byte[7:0], scanline[3:0]}
+rom_addr[10:0] = {vram_byte[6:0], scanline[3:0]}
 ```
 
-- **Bits [11:4]** = VRAM byte (character code with inverse flag in bit 7)
+- **Bits [10:4]** = Character code (7-bit ASCII, from VRAM bits [6:0])
 - **Bits [3:0]** = Scanline within the character cell (0–8 displayed, 9–15 padding)
 
-This gives 256 character entries × 16 scanlines each = 4096 bytes total.
+This gives 128 character entries × 16 scanlines each = 2048 bytes loaded. VRAM bit 7 (inverse flag) is not part of the ROM address — inverse rendering is handled by XOR inversion at pixel capture time in the `VIDEX_LINE` pipeline (§13.5).
 
-| ROM Range | VRAM Bit 7 | Character Set | Content |
-|-----------|------------|---------------|---------|
-| `$000–$7FF` | 0 (normal) | 128 normal characters | Standard pixel data |
-| `$800–$FFF` | 1 (inverse) | 128 inverse characters | Pre-inverted pixel data |
-
-Each character occupies 16 consecutive bytes. With R9 = 8 (9 scanlines per row), only bytes at offsets 0–8 within each character are displayed. Bytes at offsets 9–15 are padding (typically `$00` for normal, `$FF` for inverse).
+Each character occupies 16 consecutive bytes. With R9 = 8 (9 scanlines per row), only bytes at offsets 0–8 within each character are displayed. Bytes at offsets 9–15 are padding.
 
 ### 21.3 Pixel Format
 
@@ -2486,7 +2496,7 @@ Same fix applied to SSC (`ENA_C8S` with `SLOTROM == 3'd2` guard, commit 880a976)
 ```systemverilog
 wire crtc_read = card_dev_sel && a2bus_if.rw_n;  // no crtc_readable gate
 ```
-Write-only registers (R0–R13) and non-existent registers (R16+) return `$00`. Only R14/R15 return actual values.
+All R0–R15 return their written values (HD6845SP Type 1 behavior, matching A2DVI). Non-existent registers (R16+) and even-address reads return `$00`.
 
 ### 23.6 INTC8ROM Clearing on Non-C3 Slot Access
 
@@ -2523,11 +2533,11 @@ Tests T01–T17 transcribed from on-hardware V1.1 program. Tests T18–T21 added
 
 **Evidence**: Shadow mode (Videx rd_en_o=0 always) eliminates all bus transceiver transitions → SSC C8S2 never spuriously cleared → SSC FINIT succeeds. This confirms the PCB glitch mechanism.
 
-### 23.10 VRAM Read-Back Disabled
+### 23.10 VRAM Read-Back
 
-**Problem**: Real Videx (HD6845SP) and A2DVI both return open bus for VRAM CPU reads ($CC00-$CDFF). A2FPGA actively served these reads, which contributed to over-driving the bus.
+VRAM CPU reads (`$CC00–$CDFF`) are fully enabled. The card drives `rd_en_o` for VRAM reads when `rom_c8_active` and `phi0` are asserted. The SDPB's 32-bit read port serves both the scanner pipeline and CPU read-back (via hold register and byte selection).
 
-**Fix**: `vram_read` term in `rd_en_o` commented out. Only the scanner reads VRAM through the SDPB 32-bit port.
+Initial testing had VRAM reads disabled based on the observation that physical Videx and A2DVI return open bus under VIDEX_DIAG. The actual root cause of the Pascal hang was CPLD OE timing (§23.11), not VRAM read responses. VRAM reads were re-enabled after the OE cutoff fix resolved the hang.
 
 ### 23.11 Phase-Counter OE Cutoff (apple_bus.sv)
 
@@ -2549,7 +2559,7 @@ assign a2_bridge_bus_d_oe_n_o = ~(data_out_en_i & BUS_DATA_OUT_ENABLE & ~oe_earl
 
 ---
 
-## 24. Open Investigation: CardCat / Pascal Hang
+## 24. Resolved: Pascal Boot Hang
 
 ### 24.1 Symptom
 
@@ -2774,7 +2784,7 @@ permanently set on ][+ (now fixed by is_iie).
 | SSC C8S2 spurious clearing | **Fixed** — phi0 qualification (880a976) |
 | INTC8ROM permanently set on ][+ | **Fixed** — is_iie detection |
 | I/O writes from C8 space break disk | **Fixed** — OE cutoff verified, Pascal boots 100% |
-| VRAM read-back over-responsive | **Fixed** — disabled (matches real hardware) |
+| VRAM read-back | **Active** — re-enabled after OE cutoff fix resolved root cause |
 | Blinking cursor with no text | **Resolved** — was caused by disk I/O failure before console output |
 | PASCAL_WRITE never called | **Resolved** — p-machine was stuck in disk retry loop |
 
@@ -2792,7 +2802,7 @@ permanently set on ][+ (now fixed by is_iie).
 | Physical Videx | HD6845SP (Hitachi, Type 1) | Original hardware ROM | Yes (physical card) | **Works** (confirmed via shadow mode HDMI) |
 | A2DVI v4.4 | Emulated | Custom firmware | Yes (own transceiver) | **Works** (confirmed on HDMI) |
 | A2FPGA shadow | Emulated (Type 1) | N/A (rd_en_o=0) | No (snoops writes only) | **Works** (rendering correct) |
-| A2FPGA normal | Emulated (Type 1) | videx_rom.hex (ROM 2.4) | Yes (shared FPGA transceiver) | **Hangs** |
+| A2FPGA normal | Emulated (Type 1) | videx_rom.hex (ROM 2.4) | Yes (shared FPGA transceiver) | **Works** (OE cutoff fix) |
 
 ### 25.2 VIDEX_DIAG Results (V2.0)
 
@@ -2828,7 +2838,7 @@ permanently set on ][+ (now fixed by is_iie).
 
 3. **A2FPGA passes T08–T16**: Our emulation correctly serves expansion ROM and VRAM reads. Pascal/CardCat hangs.
 
-4. **The A2FPGA is too responsive**: The confirmed-working platform (A2DVI) and the physical Videx both don't respond to C8-space reads under VIDEX_DIAG's access pattern. Our card does. This over-responsiveness is the most likely cause of the Pascal hang.
+4. **A2FPGA serves all C8-space reads correctly**: Unlike the physical Videx and A2DVI, which return open bus for expansion ROM and VRAM reads under VIDEX_DIAG, the A2FPGA serves these reads correctly. This is the desired behavior for full emulation fidelity. The Pascal hang was caused by CPLD OE timing (§23.11), not by C8-space read responses.
 
 5. **CRTC register reads differ across platforms**:
    - Physical HD6845SP: R0 returns 0, R12 returns 63, R13 returns 60 (mixed behavior)
@@ -2858,7 +2868,7 @@ The VIDEX_DIAG test differences (physical Videx / A2DVI failing T08-T16) remain 
 | Baseline | card_io_sel only | None | Always 0 (hack) | VIDEX_DIAG pass, Pascal hang |
 | SLOTROM via a2mem_if | card_io_sel | a2mem_if.SLOTROM==3 | is_iie detection | PR#3 hangs |
 | SLOTROM + SSC pattern | Raw addr decode | a2mem_if.SLOTROM==3 | is_iie detection | PR#3 inconsistent: hangs cold boot, crashes/works after reset |
-| **Self-clearing c8_owned** | card_io_sel + clear on other $Csxx + $CFFF | **None (internal)** | is_iie detection | **VIDEX_DIAG T01-T20 pass, PR#3 works, Pascal still hangs** |
+| **Self-clearing c8_owned** | card_io_sel + clear on other $Csxx + $CFFF | **None (internal)** | is_iie detection | **VIDEX_DIAG T01-T20 pass, PR#3 works, Pascal works (with OE cutoff)** |
 
 ### 26.2 Key Findings
 
@@ -2868,11 +2878,11 @@ The VIDEX_DIAG test differences (physical Videx / A2DVI failing T08-T16) remain 
 
 3. **Probable timing mismatch**: SLOTROM is updated on phi1_posedge in apple_memory.sv, but card signals use different clock qualifications (phi0, card_io_sel, etc.). The SLOTROM value may not be stable when the card evaluates rom_c8_active during the same bus cycle.
 
-4. **Current approach (implemented and tested)**: Self-clearing `c8_owned`. The card monitors `$C1xx-$C7xx` directly (phi0-qualified) and clears `c8_owned` when any non-slot-3 `$Csxx` address is accessed. This removes all dependency on SLOTROM, implementing the ownership protocol internally. `rom_c8_active = c8_owned && !INTCXROM` (no SLOTROM guard). PR#3 works, VIDEX_DIAG T01-T20 pass. Pascal still hangs — the self-clearing approach is necessary but not sufficient.
+4. **Current approach (implemented and tested)**: Self-clearing `c8_owned`. The card monitors `$C1xx-$C7xx` directly (phi0-qualified) and clears `c8_owned` when any non-slot-3 `$Csxx` address is accessed. This removes all dependency on SLOTROM, implementing the ownership protocol internally. `rom_c8_active = c8_owned && !INTCXROM` (no SLOTROM guard). PR#3 works, VIDEX_DIAG T01-T20 pass. Pascal works with the additional OE cutoff fix (§23.11).
 
 ### 26.3 INTC8ROM Fix Status
 
-The `is_iie` runtime detection approach (upstream fix #2) is implemented in apple_memory.sv and under test. This gates the INTC8ROM logic so it only activates on Apple IIe systems, where it is needed for the internal 80-column firmware. On Apple ][+, INTC8ROM remains 0, allowing io_strobe_n to fire normally for all slot 3 cards.
+The `is_iie` runtime detection approach is implemented and verified in apple_memory.sv. This gates the INTC8ROM logic so it only activates on Apple IIe systems, where it is needed for the internal 80-column firmware. On Apple ][+, INTC8ROM remains 0, allowing io_strobe_n to fire normally for all slot 3 cards.
 
 ### 26.4 cfff_access Fix (Root Cause of Non-Determinism)
 
