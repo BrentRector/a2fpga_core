@@ -51,11 +51,11 @@ The card is **fully self-contained**: CRTC registers, VRAM, character ROM, rende
 
 ## 2. Address Decoding
 
-The card responds to three address regions. All decoding is active during `phi1_posedge` when `!m2sel_n`.
+The card responds to three address regions. Timing qualification varies by path: CRTC/bank writes use `phi1_posedge && !m2sel_n`, VRAM writes use `data_in_strobe`, and all reads use `phi0`-qualified signals.
 
 ### 2.1 Device I/O: `$C0B0–$C0BF`
 
-Active when `slot_if.dev_select_n` is asserted (active-low) and `slot_if.card_id == ID`. The slot 3 device select range is `$C0B0–$C0BF` (16 addresses).
+Reads are qualified by `card_dev_sel` (`card_sel && !slot_if.dev_select_n`, phi0-gated). Writes use raw address decode (`addr[15:4] == 12'hC0B`) with `phi1_posedge && !m2sel_n && card_enable`. The slot 3 device select range is `$C0B0–$C0BF` (16 addresses).
 
 | Bits | Meaning |
 |------|---------|
@@ -68,7 +68,7 @@ Active when `slot_if.io_select_n` is asserted. The card drives `data_o` with the
 
 ### 2.3 Expansion ROM: `$C800–$CFFF`
 
-Active when the card owns the expansion ROM space (ownership flag is set) and `a2bus_if.phi0` is high. The card drives `data_o` with the firmware ROM byte. The VRAM window at `$CC00–$CDFF` overlaps this range — see Section 5.
+Active when `rom_c8_active` is set (`c8_owned && !INTCXROM`) and `a2bus_if.phi0` is high. The card drives `data_o` with the firmware ROM byte. The VRAM window at `$CC00–$CDFF` overlaps this range — see Section 5.
 
 > **Note**: The implementation uses `rom_c8_active && phi0` rather than `card_io_strobe` (`!slot_if.io_strobe_n && phi0`). This is necessary because `io_strobe_n` is blocked by `INTC8ROM` on the Apple ][+ — see Section 6.6 for the full explanation. The card uses self-clearing `c8_owned` ownership (cleared on other-slot `$Csxx` access) instead of a `SLOTROM` guard — see §3 for details.
 
@@ -142,7 +142,7 @@ reg [7:0] crtc_regs[0:15];   // R0–R15
 
 **Odd address** (`addr[0] == 1`): If `crtc_idx < 16`, write `data[7:0]` to `crtc_regs[crtc_idx]`.
 
-All writes also update the VRAM bank select from `addr[3:2]` (Section 2.1).
+All accesses (read or write) also update the VRAM bank select from `addr[3:2]` (Section 2.1).
 
 ### 4.3 Read Behavior (HD6845SP Type 1)
 
@@ -219,7 +219,7 @@ Five CRTC registers differ between the two variants:
 
 **Hypothesis for the difference**: The original Videx VideoTerm was designed in 1980–1981 for the US market (NTSC, 60 Hz). The ROM 2.4 image preserved in the Apple II Documentation Project and btb/80ColumnCard repository produces 50 Hz timing, suggesting it may have been a later revision for European/PAL markets, or (more likely) the CRTC init values were not critical since the Videx generates its own independent video timing from its 17.430 MHz crystal — the Apple II's NTSC sync is irrelevant to the Videx output. The CRT monitor connected to the Videx's DB-15 port would free-run at whatever rate the card produces.
 
-**Impact on A2FPGA**: The HDMI rendering pipeline in `apple_video.sv` ignores R0–R8 entirely. It uses hard-coded geometry (80 columns × 24 rows × 9 scanlines at 720×480 HDMI). Only R9–R15 (which are identical between both variants) affect display output. **The 50 Hz vs. 60 Hz distinction is irrelevant for FPGA implementation.**
+**Impact on A2FPGA**: The internal rendering pipeline in `videx_card.sv` ignores R0–R8 entirely. It uses hard-coded geometry (80 columns × 24 rows × 9 scanlines at 720×480 HDMI). Only R10–R15 (which are identical between both variants) affect display output. R9 is stored for CRTC read-back but the scanline count is hardcoded to 9. **The 50 Hz vs. 60 Hz distinction is irrelevant for FPGA implementation.**
 
 ### 4.5 Which Registers the Renderer Uses
 
@@ -227,7 +227,6 @@ The internal rendering pipeline reads these CRTC registers directly from the car
 
 | Register | Renderer Use |
 |----------|-------------|
-| R9[3:0]  | Max scanline (character height - 1) |
 | R10      | Cursor start line + blink mode |
 | R11      | Cursor end line |
 | R12      | Display start address high (hardware scroll) |
@@ -235,11 +234,11 @@ The internal rendering pipeline reads these CRTC registers directly from the car
 | R14      | Cursor position high |
 | R15      | Cursor position low |
 
-R0–R8 define CRT timing that is irrelevant to HDMI rendering. They must be stored (for R14/R15 read-back indexing to work) but are not used by the renderer.
+R0–R9 define CRT timing that is irrelevant to HDMI rendering. They must be stored (for read-back to work) but are not used by the renderer. The scanline count is hardcoded to 9 via divide-by-9 arithmetic rather than reading R9.
 
 ### 4.6 Driving the Renderer
 
-The rendering pipeline accesses CRTC registers directly from the internal register array (`crtc_regs[0:15]`). No signals are exported via `a2mem_if`. The renderer latches the display-critical registers (R10–R15) during video blanking for stability, the same way `apple_video.sv` latches mode switches.
+The rendering pipeline accesses CRTC registers directly from the internal register array (`crtc_regs[0:15]`). No signals are exported via `a2mem_if`. The renderer latches the display-critical registers (R10–R15) during video blanking on `clk_pixel` for stability, following the same blanking-latch pattern used throughout the project.
 
 The Videx display mode is active when `card_enable && TEXT_MODE && AN0`. `TEXT_MODE` and `AN0` are read from `a2mem_if` via the `slave` modport (read-only, no interface changes). `card_enable` is the standard slot_if.card pattern flag.
 
@@ -357,14 +356,17 @@ Loaded from `videx_rom.hex` via `$readmemh`.
 
 ### 6.3 Read Response
 
-```
-if slot ROM access ($C300–$C3FF):
-    data_o <= rom[{2'b11, addr[7:0]}]   // 10-bit index, offset $300–$3FF
-    rd_en_o <= 1
+The ROM read path is unified for both slot ROM and expansion ROM. A 2-stage registered pipeline reads the ROM array each `clk_logic` cycle; the address mux selects the appropriate offset:
 
-if expansion ROM access ($C800–$CBFF) and ownership flag set:
-    data_o <= rom[addr[9:0]]             // ROM $000–$3FF
-    rd_en_o <= 1
+```
+rom_addr = card_io_sel ? {2'b11, addr[7:0]}  // slot ROM: offset $300–$3FF
+                       : addr[9:0];           // expansion ROM: $000–$3FF
+rom_data_r  <= rom[rom_addr];                 // pipeline stage 1
+rom_data_rr <= rom_data_r;                    // pipeline stage 2
+
+data_o = crtc_read ? crtc_data :              // priority mux (§10.1)
+         vram_read ? vram_read_byte :
+         rom_data_rr;                         // ROM is fallback
 ```
 
 ### 6.4 Expansion ROM vs. VRAM Window Priority
@@ -528,13 +530,13 @@ Only scanlines 0–8 are displayed (R9 = 8). Each character cell is 7 pixels wid
 
 ### 10.1 Response Priority
 
-When multiple address ranges could match, priority from highest to lowest:
+The `data_o` output mux priority from highest to lowest:
 
-1. **VRAM window** (`$CC00–$CDFF`, ownership set) — read/write VRAM
-2. **CRTC registers** (`$C0B0–$C0BF`) — register I/O + bank select
-3. **Slot ROM** (`$C300–$C3FF`) — serve ROM byte, set ownership
-4. **Expansion ROM** (`$C800–$CBFF`, ownership set) — serve ROM byte
-5. **`$CFFF`** — clear ownership (no data driven)
+1. **CRTC registers** (`$C0B0–$C0BF`) — register I/O + bank select
+2. **VRAM window** (`$CC00–$CDFF`, ownership set) — read/write VRAM
+3. **ROM** (`$C300–$C3FF` slot, `$C800–$CBFF` expansion) — serve ROM byte (fallback)
+
+All address ranges are non-overlapping, so the priority order has no functional impact. The `$CFFF` strobe clears ownership but drives no data.
 
 ### 10.2 Timing
 
@@ -555,7 +557,7 @@ assign a2_bridge_bus_d_oe_n_o = ~(data_out_en_i & BUS_DATA_OUT_ENABLE & ~oe_earl
 
 If `rd_en_o` is true during phi1, the transceiver drives the Apple II data bus while the 6502 is simultaneously placing the address high byte on it — causing bus contention and system crashes. Every signal that feeds `rd_en_o` must include phi0: `card_io_sel` and `card_dev_sel` inherit it from `card_sel`; `exp_rom_read` and `vram_read` include it explicitly.
 
-The OE cutoff addresses a secondary timing issue: the CDC denoise pipeline delays phi0 by ~6 clk_logic cycles (~100ns). Without the cutoff, `data_out_en_i` keeps the CPLD bus driver active for the full CDC delay into phi1. The cutoff releases OE at phase cycle 22 (of 26), approximately 37ns after the estimated real phi0 drop — matching real slot card 74LS245 release timing. This is critical for I/O writes ($C0xx) from C8 space, which are sensitive to extended bus driving. See §24.7 for the ROM patch test evidence.
+The OE cutoff addresses a secondary timing issue: the CDC denoise pipeline delays phi0 by ~6 clk_logic cycles (~100ns). Without the cutoff, `data_out_en_i` keeps the CPLD bus driver active for the full CDC delay into phi1. The cutoff releases OE at phase cycle 22 (of 26), approximately 37ns after the estimated real phi0 drop — matching real slot card 74LS245 release timing. This is critical for I/O writes ($C0xx) from C8 space, which are sensitive to extended bus driving.
 
 The card must drive `data_o` early enough in the bus cycle for the CPU to sample it. The `apple_bus.sv` bridge checks `data_out_en_i` at `phase_cycles_r == WRITE_COUNT` (10 clk_logic cycles into phi0, ~185 ns) and samples `data_out_i` one cycle later. The ROM pipeline (2-stage registered read) settles well within this window (~14 clk_logic cycles from address latch to data sample). The OE cutoff at cycle 22 is well after IO_WRITE_DATA completes (cycle 13).
 
@@ -596,8 +598,8 @@ wire card_dev_sel = card_sel && !slot_if.dev_select_n;    // $C0Bx during phi0
 wire card_io_sel  = card_sel && !slot_if.io_select_n;     // $C300-$C3FF during phi0
 // NOTE: card_io_strobe is NOT used — see Section 6.6.1 (INTC8ROM blocks it for slot 3)
 
-// Other-slot detection for self-clearing ownership (see §3)
-wire other_slot_rom = phi0 && addr[15:11]==5'b1100_0 && addr[10:8]!=3'd3 && addr[10:8]!=3'd0;
+// Other-slot detection for self-clearing ownership (see §3) — phi0-qualified
+wire other_slot_rom = a2bus_if.phi0 && addr[15:11]==5'b1100_0 && addr[10:8]!=3'd3 && addr[10:8]!=3'd0;
 
 // C8 space ownership — self-clearing, independent of SLOTROM (see §6.6.2)
 wire rom_c8_active = c8_owned && !a2mem_if.INTCXROM;
@@ -629,8 +631,8 @@ on data_in_strobe, if rom_c8_active && vram_window && !rw_n:
 on posedge clk_logic, if card_io_sel:
     c8_owned <= 1;
 
-// 5. $CFFF or other-slot $Csxx → clear ownership
-on posedge clk_logic, if !INTCXROM && (addr == $CFFF || other_slot_rom):
+// 5. $CFFF or other-slot $Csxx → clear ownership (phi0-qualified via cfff_access and other_slot_rom)
+on posedge clk_logic, if !INTCXROM && (cfff_access || other_slot_rom):
     c8_owned <= 0;
 ```
 
@@ -645,19 +647,17 @@ if card_dev_sel && rw_n:
     else:
         data_o = $00;
 
-// 7. Slot ROM read — registered (2-stage pipeline for GoWin distributed RAM)
-if card_io_sel && rw_n:
-    data_o = rom[{2'b11, addr[7:0]}];       // last 256 bytes of 1KB ROM
-
-// 8. VRAM read — from SDPB hold register, phi0-qualified (NOT card_io_strobe, see §6.6.1)
+// 7. VRAM read — from SDPB hold register, phi0-qualified (NOT card_io_strobe, see §6.6.1)
 if rom_c8_active && phi0 && vram_window && rw_n:
     data_o = vram_read_byte;                 // byte-selected from 32-bit cpu_hold
 
-// 9. Expansion ROM read — registered, phi0-qualified (NOT card_io_strobe, see §6.6.1)
-if rom_c8_active && phi0 && exp_rom_range && rw_n:
-    data_o = rom[addr[9:0]];                 // full 1KB ROM
+// 8. ROM read (slot or expansion) — unified 2-stage registered pipeline
+//    rom_addr = card_io_sel ? {2'b11, addr[7:0]} : addr[9:0]
+//    rom_data_r  <= rom[rom_addr];   // stage 1
+//    rom_data_rr <= rom_data_r;      // stage 2
+//    data_o = rom_data_rr (fallback when neither CRTC nor VRAM matches)
 
-// rd_en_o = card_enable && (any of cases 6-9)
+// rd_en_o = card_enable && (any of cases 6-8)
 ```
 
 ### Renderer Interface
@@ -789,59 +789,126 @@ When `videx_active` is false, the video output ports pass through the input Appl
 
 The Videx content window (432 lines) is taller than the Apple text window (384 lines). In the extended border areas (lines 24–47 and 432–455), Apple video outputs border color but Videx renders text content. The video mux replaces these pixels when Videx is active.
 
-### 13.3 VRAM Address for Rendering
+### 13.3 Scan Window and Pipeline Offset
+
+The rendering pipeline runs ahead of the display output by `SCAN_PIX_OFFSET = 32` pixels. This gives the pipeline time to fetch VRAM data and render characters before pixels are needed:
+
+```systemverilog
+wire scan_x_active_w = (screen_x_i > (H_LEFT_BORDER - SCAN_PIX_OFFSET))
+                     & (screen_x_i < (H_RIGHT_BORDER - SCAN_PIX_OFFSET));
+wire scan_active_w = scan_x_active_w & y_active_w;
+wire scan_start_w  = (screen_x_i == (H_LEFT_BORDER - SCAN_PIX_OFFSET)) & y_active_w;
+```
+
+`scan_start_w` resets the pipeline counters (`pix_step_r` and `h_offset_r`) at the beginning of each scanline.
+
+### 13.4 28-Step Pixel Cycle
+
+The pipeline processes 4 characters (28 pixels + 1 gap pixel = 29 total in the buffer) per cycle. A 5-bit step counter (`pix_step_r`) counts 0–27, resetting on `scan_start_w`.
+
+Key pipeline stages:
+
+| Step | Action |
+|------|--------|
+| 0 (`STEP_LOAD_MEM`) | Issue VRAM read: set `scanner_vram_addr` and `scanner_vram_rd` |
+| 1–13 | SDPB pipeline + hold register capture (clk_logic domain, see §13.5) |
+| 14 (`STEP_LATCH_MEM`) | Latch `scanner_hold` into `videx_data_r`; clear gap pixel `pix_buffer_r[28]` |
+| 15 | Issue charrom lookup for char 0 (`videx_data_r[6:0]`) |
+| 16 | Issue charrom lookup for char 1 (`videx_data_r[14:8]`) |
+| 17 | Capture char 0 pixels with inverse/cursor XOR; issue charrom lookup for char 2 |
+| 18 | Capture char 1 pixels with inverse/cursor XOR; issue charrom lookup for char 3 |
+| 19 | Capture char 2 pixels with inverse/cursor XOR |
+| 20 | Capture char 3 pixels with inverse/cursor XOR |
+| 27 (`STEP_LAST`) | Load shift register from pixel buffer; advance `h_offset_r += 2` |
+
+The column counter `h_offset_r` (6 bits) advances by 2 each cycle. The VRAM byte address is computed as `{4'b0, h_offset_r, 1'b0}` (effectively `h_offset * 2`), so consecutive cycles read consecutive 4-byte VRAM words. Over 20 cycles: 80 columns.
+
+### 13.5 Clock Domain Crossing (clk_pixel ↔ clk_logic)
+
+The rendering pipeline runs on `clk_pixel` (27 MHz) while the VRAM SDPB runs on `clk_logic` (54 MHz). These clocks have a 2:1 PLL relationship — every `clk_pixel` edge is coincident with a `clk_logic` edge. No explicit synchronizers are needed.
+
+The VRAM read path:
+1. `scanner_vram_rd` asserted on `clk_pixel` (step 0)
+2. Crosses to `clk_logic` domain (0–1 cycle jitter)
+3. SDPB 2-cycle pipeline (READ_MODE=1)
+4. `scanner_rd_d1/d2` tracking (2 clk_logic cycles)
+5. `scanner_hold` capture (1 clk_logic cycle)
+6. Total: ~6 clk_logic cycles worst case
+
+The `scanner_hold` register is written on `clk_logic` and read on `clk_pixel` at step 14 (= 28 clk_logic cycles after step 0). With a 6-cycle path, there are 22 clk_logic cycles of margin.
+
+### 13.6 VRAM Address for Rendering
 
 ```
 row_start = (text_base + row × 80) mod 2048
-char_addr = (row_start + column) mod 2048
+char_addr = (row_start + h_offset × 2) mod 2048
 ```
 
-Where `text_base = {R12[2:0], R13[7:0]}` from the internal CRTC register file. This is the 11-bit circular buffer address. The VRAM SDPB read port is shared between the rendering scanner (priority) and CPU read-back, using the same mux/hold-register mechanism as before — now entirely internal to the card.
+Where `text_base = {R12[2:0], R13[7:0]}` from the internal CRTC register file. The SDPB reads at `char_addr[10:2]` (word address), returning 4 consecutive bytes. The VRAM SDPB read port is shared between the rendering scanner (priority) and CPU read-back — entirely internal to the card.
 
-### 13.4 Character ROM Lookup
+Row and scanline are computed from `screen_y` using hardcoded divide-by-9 arithmetic:
+```
+content_y = (screen_y - V_BORDER) >> 1        // range 0–215
+row       = (content_y × 57) >> 9             // integer divide-by-9
+scanline  = content_y - row × 9               // remainder 0–8
+```
 
-The 2 KB half-size character ROM (`videx_charrom.hex`) is instantiated inside `videx_card.sv`:
+### 13.7 Character ROM Lookup
+
+The 2 KB half-size character ROM (`videx_charrom.hex`) is instantiated inside `videx_card.sv`. The charrom has no `syn_ramstyle` annotation — the synthesizer infers pROM (1 BSRAM block):
 
 ```
 rom_addr = {vram_byte[6:0], scanline[3:0]}   // 11-bit address into 2 KB ROM
 pixel_data = videxrom[rom_addr]               // 8 bits, only lower 7 used
 ```
 
-The ROM stores only normal characters (0x00–0x7F). Inverse characters use the same ROM data with pixel inversion applied at capture (§13.5).
+The ROM stores only normal characters (0x00–0x7F). Inverse characters use the same ROM data with pixel inversion applied at capture (§13.8).
 
-### 13.5 Cursor Rendering
+### 13.8 Cursor Rendering
 
 Cursor position: `{R14[2:0], R15[7:0]}` (11-bit VRAM address, from internal CRTC registers).
 Blink mode from R10[6:5]: `00`=always on, `01`=hidden, `10`=1/16 field rate, `11`=1/32 field rate.
 Scanline range: R10[3:0] (start) to R11[3:0] (end).
 
-Rendered by XOR combining the character's inverse flag (vram bit 7) with the cursor active flag:
+Cursor matching is per-byte within each 4-character VRAM word:
 ```
-pixel_out = rom_data[6:0] ^ {7{vram_byte[7] ^ cursor_active}}
+cursor_in_group = (cursor_addr - char_addr) < 4
+cursor_byte     = (cursor_addr - char_addr)[1:0]
 ```
+
+Rendered by XOR combining the character's inverse flag (vram bit 7) with per-byte cursor matching:
+```
+pix_buffer[6:0] = rom_data[6:0] ^ {7{vram_byte[7] ^ (cursor_active && cursor_byte == N)}}
+```
+Where `N` is 0, 1, 2, or 3 for each of the 4 characters in the group.
+
 This means: normal char + no cursor = normal pixels, inverse char + no cursor = inverted pixels, normal char + cursor = inverted pixels, inverse char + cursor = normal pixels (double inversion cancels).
 
-### 13.6 Video Multiplexer Output
+### 13.9 Pixel Output and History Delay
+
+The 29-bit pixel buffer is loaded into a shift register (`pix_shift_r`) at `STEP_LAST`. The shift register outputs one pixel per `clk_pixel` cycle via `pix_out_w = pix_shift_r[0]`.
+
+A pixel history shift register (`pix_history_r`, 8 bits) provides pipeline alignment delay. The color logic reads from `pix_history_r[HISTORY_PIXEL_OFFSET]` (offset 4) to align Videx pixel timing with the display output.
+
+### 13.10 Video Multiplexer Output
 
 The card outputs pixel-level multiplexed RGB using the SuperSprite pattern:
 
 ```systemverilog
-assign videx_r_o = videx_pixel_active ? videx_rgb_r : apple_vga_r_i;
-assign videx_g_o = videx_pixel_active ? videx_rgb_g : apple_vga_g_i;
-assign videx_b_o = videx_pixel_active ? videx_rgb_b : apple_vga_b_i;
+assign videx_r_o = videx_pixel_active ? {pix_r, 4'h0} : apple_vga_r_i;
+assign videx_g_o = videx_pixel_active ? {pix_g, 4'h0} : apple_vga_g_i;
+assign videx_b_o = videx_pixel_active ? {pix_b, 4'h0} : apple_vga_b_i;
 ```
 
-`videx_pixel_active` is true when `videx_active` (mode is on) AND the current pixel is within the Videx content window (560 × 432).
+`videx_pixel_active` is true when `videx_active` (mode is on) AND the current pixel is within the Videx content window (560 × 432). The 4-bit palette color (`pix_r/g/b`) is expanded to 8-bit RGB by zero-filling the low nibble.
 
-### 13.7 Color Generation
+### 13.11 Color Generation
 
-The card includes the Apple II/IIgs color palette (same 32-entry table as `apple_video.sv`) and uses `TEXT_COLOR` / `BACKGROUND_COLOR` / `BORDER_COLOR` from `a2mem_if` for colorization:
+The card includes the Apple II/IIgs color palette (32-entry table indexed by `{sw_gs, color[3:0]}`) and uses `TEXT_COLOR` / `BACKGROUND_COLOR` / `BORDER_COLOR` from `a2mem_if` for colorization. The `sw_gs` flag selects between Apple II (sRGB) and IIgs palette entries.
 
-- Pixel on → `TEXT_COLOR` → palette lookup → 8-bit RGB
-- Pixel off → `BACKGROUND_COLOR` → palette lookup → 8-bit RGB
-- Outside content window → pass-through Apple video (which already has border color)
-
-This matches the current rendering behavior and respects IIgs color settings.
+- Pixel on (within content window) → `TEXT_COLOR` → palette lookup → 4-bit RGB → 8-bit via `{nibble, 4'h0}`
+- Pixel off (within content window) → `BACKGROUND_COLOR` → palette lookup → 8-bit RGB
+- Outside content window → pass-through Apple video (which already has border color from `apple_video.sv`)
 
 ---
 
@@ -862,23 +929,23 @@ All Videx BSRAM resources are inside `videx_card.sv`. The character ROM halving 
 
 ---
 
-## 15. Files to Create/Modify
+## 15. Files Modified
 
 ### 15.1 Refactoring Checklist (Standalone Card Architecture)
 
-This checklist tracks progress on the refactor from the patched-video architecture to the standalone SuperSprite-pattern architecture. Each item represents an atomic change.
+Refactor from the patched-video architecture to the standalone SuperSprite-pattern architecture. Completed in commit `5bbc7a9`.
 
 | # | File | Action | Description | Status |
 |---|------|--------|-------------|--------|
-| 1 | `hdl/memory/a2mem_if.sv` | **Modify** | Remove `VIDEX_MODE`, `VIDEX_CRTC_R9`–`R15` declarations; remove from `slave` modport; delete `videx` modport | Pending |
-| 2 | `hdl/video/apple_video.sv` | **Modify** | Remove `VIDEX_SUPPORT` param, Videx ports, charrom, `VIDEX_LINE` pipeline, geometry, cursor logic — restore to upstream-clean state | Pending |
-| 3 | `hdl/videx/videx_card.sv` | **Rewrite** | Add rendering pipeline, charrom, video mux, color generation; change `a2mem_if.videx` → `a2mem_if.slave`; remove scanner VRAM external ports; add video chain I/O ports | Pending |
-| 4 | `boards/a2n20v2/hdl/top.sv` | **Modify** | Remove VIDEX_SUPPORT from apple_video; rewire videx_card with video chain ports; chain VGC → Videx → SuperSprite; remove VIDEX_* stub assignments | Pending |
-| 5 | `boards/a2n20v1/hdl/top.sv` | **Modify** | Remove `VIDEX_SUPPORT(0)` from apple_video, remove Videx stub ports, remove `a2mem_if.VIDEX_*` assignments | Pending |
-| 6 | `boards/a2n20v2-Enhanced/hdl/top.sv` | **Modify** | Same as #5 | Pending |
-| 7 | `boards/a2mega/hdl/top.sv` | **Modify** | Same as #5 | Pending |
-| 8 | `boards/a2n9/hdl/top.sv` | **Modify** | Same as #5 | Pending |
-| 9 | `boards/a2p25/hdl/top.sv` | **Modify** | Same as #5 | Pending |
+| 1 | `hdl/memory/a2mem_if.sv` | **Restored** | Upstream original — no VIDEX signals, no `videx` modport | Done |
+| 2 | `hdl/video/apple_video.sv` | **Restored** | Upstream original — no `VIDEX_SUPPORT`, no Videx rendering code | Done |
+| 3 | `hdl/videx/videx_card.sv` | **Rewrite** | Added rendering pipeline, charrom, video mux, color generation; `a2mem_if.slave`; video chain I/O ports | Done |
+| 4 | `boards/a2n20v2/hdl/top.sv` | **Modified** | Rewired video chain VGC → Videx → SuperSprite; removed VIDEX_* stubs | Done |
+| 5 | `boards/a2n20v1/hdl/top.sv` | **Restored** | Upstream original | Done |
+| 6 | `boards/a2n20v2-Enhanced/hdl/top.sv` | **Restored** | Upstream original | Done |
+| 7 | `boards/a2mega/hdl/top.sv` | **Restored** | Upstream original | Done |
+| 8 | `boards/a2n9/hdl/top.sv` | **Restored** | Upstream original | Done |
+| 9 | `boards/a2p25/hdl/top.sv` | **Restored** | Upstream original | Done |
 
 ### 15.2 Existing Files (Unchanged)
 
@@ -940,6 +1007,23 @@ This checklist tracks progress on the refactor from the patched-video architectu
 - [ ] `CTRL-Z` + `'0'` reinitializes card
 - [ ] Returning to BASIC prompt and typing `PR#3` re-enters 80-column mode
 
+### 16.8 VIDEX_DIAG
+
+- [ ] T01–T04 pass (slot ROM, CRTC address/data)
+- [ ] T07 pass (CRTC register read-back)
+- [ ] T08 pass (expansion ROM)
+- [ ] T09–T16 pass (VRAM byte-level read/write)
+- [ ] T17 pass (VRAM page test)
+- [ ] T20 pass (full VRAM)
+- See §25 for cross-platform comparison results
+
+### 16.9 Pascal Boot
+
+- [ ] Apple Pascal 1.3 boots to 80-column prompt with Videx in slot 3
+- [ ] Pascal detects Videx as type 6 (firmware) and calls FINIT
+- [ ] Text output works via WFIRM → SER1 → FVEC1 → $C31C
+- See §24 for resolved Pascal hang investigation
+
 ---
 
 ## 17. Reference: Firmware Entry Points
@@ -999,7 +1083,7 @@ For understanding the exact order of hardware accesses during initialization:
 | Property | Value |
 |----------|-------|
 | File | `hdl/videx/videx_rom.hex` (1024 lines, one hex byte per line) |
-| Format | `$readmemh` compatible — loaded in SystemVerilog with `$readmemh("videx_rom.hex", rom, 0)` |
+| Format | `$readmemh` compatible — loaded in SystemVerilog with `$readmemh("videx_rom.hex", rom)` |
 | Version | Videx VideoTerm Firmware v2.4 (50 Hz variant) |
 | Size | 1024 bytes (1 KB) |
 | SHA-256 | `616f4d9f81a7a4ea0fa918842a05dfb3b503927776d2bfe97e6950b5431b562e` |
@@ -1157,7 +1241,7 @@ $CBF0:   90 D1 60 38 71 B2 7B 00 48 66 C4 C2 C1 FF C3 EA   ..`8q.{.Hf......
 | `$CA59` | `VRAM_WRITE` | `$CA23` | Write one character position to VRAM |
 | `$CA71` | `ENCODE_CHAR` | `$CA59` | Encode char: `{inverse, ascii[6:0]}`, select bank |
 | `$CA89` | `OUTPT1` | Output path | Main output wrapper: set CRTC, check mode |
-| `$CAD1` | `PAUSE_CHECK` | `$CA89` | Check Ctrl-S pause via keyboard |
+| `$CACF` | `PAUSE_CHECK` | `$CA89` | Check Ctrl-S pause via keyboard |
 | `$CAE6` | `PRINT_MSG` | `$CB36` | Print message string via ESC dispatch |
 | `$CB36` | `MAIN_HANDLER` | `$CB00` | Central dispatcher: save regs, route I/O/cold |
 
@@ -2374,23 +2458,24 @@ ASCII char ─────→  VRAM byte  ──── stored in ────→
                          │         VRAM $CC00-          │              │
                          │         $CDFF                │              │
                                                         │              │
-  Formula:                                    {vram[7:0],         bits[6:0]
+  Formula:                                    {vram[6:0],         bits[6:0]
   vram = {inverse,                             scanline[3:0]}     = 7 pixels
-          char[6:0]}
+          char[6:0]}                           (11-bit, 2KB ROM)
 
 Example: Normal 'A' ($41)
   char = $41 (0100_0001)
   inverse = 0
   vram = {0, 100_0001} = $41
-  rom_addr = $41 * 16 + scanline = $410 + scanline
+  rom_addr = {$41[6:0], scanline} = {$41, scanline} = $410 + scanline
   scanline 0: rom[$410] = $18 → pixels = .##....
 
 Example: Inverse 'A' ($41 with inverse flag)
   char = $41
   inverse = 1
   vram = {1, 100_0001} = $C1
-  rom_addr = $C1 * 16 + scanline = $C10 + scanline
-  scanline 0: rom[$C10] = $E7 → pixels = ###..###  (inverted)
+  rom_addr = {$C1[6:0], scanline} = {$41, scanline} = $410 + scanline  (same ROM data!)
+  scanline 0: rom[$410] = $18 → pixel_out = $18 ^ $7F = $67 → pixels = ###..###
+  (XOR with vram[7]=1 inverts all 7 pixels)
 ```
 
 ### 21.6 Notable Character ROM Anomalies and Features
@@ -2474,7 +2559,7 @@ The identification sequence for each slot `s`:
 | 5 | Printer card | `$48` | `$48` |
 | 6 | Firmware card | `$48` | `$48` |
 
-The Videx VideoTerm has `$C305=$38`, `$C307=$18` → SLTTYPS type 4 (Serial card). This is the standard Pascal 1.0 protocol identifier; the actual device class is in `$Cs0C`.
+The Videx VideoTerm has `$C305=$38`, `$C307=$18`, `$C30B=$01`. The byte5/byte7 pattern matches type 4 (Serial), but Pascal v1.1+ refines this via `$Cs0B` (`byte11`): `$01` → **type 6 (Firmware card)**. See §24.3 for the confirmed Pascal detection path.
 
 ### 22.4 Device Signature Byte (`$Cs0C`)
 
@@ -2542,7 +2627,7 @@ The Pascal entries bypass `MAIN_HANDLER` entirely and never access `$CFFF`. This
 ### 23.1 Initial Implementation (commit 123f8d4)
 
 - Combined architecture: single `videx_card.sv` owns ROM, CRTC, VRAM, bus response
-- `a2mem_if.videx` modport for VIDEX_* signals
+- Initially used `a2mem_if.videx` modport for VIDEX_* signals (later removed in §23.12)
 - VRAM as `sdpram32` instances
 
 ### 23.2 VRAM Optimization (commit c8b9c13)
@@ -2553,7 +2638,7 @@ The Pascal entries bypass `MAIN_HANDLER` entirely and never access `$CFFF`. This
 ### 23.3 Character ROM Halving (commit 7458d97)
 
 - Chars `$80`–`$FF` are bitwise inverse of `$00`–`$7F`
-- Store 2 KB, XOR at capture points in `VIDEX_LINE` pipeline
+- Store 2 KB, XOR at capture points in the rendering pipeline
 - Saves 1 BSRAM block (charrom from 2 pROM to 1 pROM)
 
 ### 23.4 SLOTROM Guard Fix (applied in videx_card.sv, SSC)
@@ -2569,7 +2654,7 @@ wire rom_c8_active = rom_ownership && !a2mem_if.INTCXROM && (a2mem_if.SLOTROM ==
 
 Same fix applied to SSC (`ENA_C8S` with `SLOTROM == 3'd2` guard, commit 880a976).
 
-**Required**: Added `SLOTROM` to `a2mem_if.videx` modport.
+> **Note**: The SLOTROM guard was later replaced by self-clearing `c8_owned` that monitors other-slot `$Csxx` accesses directly (§3). The `a2mem_if.videx` modport was removed in §23.12.
 
 ### 23.5 CRTC Read-Back Fix (Open Bus Gotcha)
 
@@ -2664,7 +2749,7 @@ assign a2_bridge_bus_d_oe_n_o = ~(data_out_en_i & BUS_DATA_OUT_ENABLE & ~oe_earl
 
 **What was unchanged**: Bus logic, CRTC register file, VRAM SDPB, firmware ROM, C8 ownership protocol, address decoding — all remain in `videx_card.sv` as before. BSRAM cost unchanged (44/46 blocks).
 
-**Status**: Pending — see §15.1 for per-file refactoring checklist.
+**Status**: Done (commit `5bbc7a9`). Build clean at 44/46 BSRAM. All hardware tests pass.
 
 ---
 
@@ -2676,9 +2761,9 @@ Apple Pascal 1.3 initially hung during boot with the Videx card enabled. Multipl
 
 | Root Cause | Fix | Reference |
 |------------|-----|-----------|
-| `cfff_access` not phi0-qualified — address bus transients during phi1 spuriously cleared `c8_owned` → open bus → non-deterministic crashes | phi0 qualification: `wire cfff_access = a2bus_if.phi0 && (addr == 16'hCFFF)` | §23.9 |
+| `cfff_access` not phi0-qualified — address bus transients during phi1 spuriously cleared `c8_owned` → open bus → non-deterministic crashes | phi0 qualification: `wire cfff_access = a2bus_if.phi0 && (addr == 16'hCFFF)` | §23.8 |
 | SSC `C8S2` not phi0-qualified — PCB bus transceiver glitches (from Videx rd_en_o transitions) caused SSC expansion ROM ownership to clear mid-execution | phi0 gate on entire C8S2 case block in `super_serial_card.sv` | §23.9 |
-| INTC8ROM permanently set on Apple ][+ — blocked io_strobe_n for ALL slot 3 cards | `is_iie` runtime detection gates INTC8ROM (Apple IIe only) | §23.8 |
+| INTC8ROM permanently set on Apple ][+ — blocked io_strobe_n for ALL slot 3 cards | `is_iie` runtime detection gates INTC8ROM (Apple IIe only) | §23.6 |
 | CPLD bus transceiver OE held ~100ns into phi1 — I/O writes from C8-space created bus contention that corrupted disk I/O | Phase-counter OE cutoff in `apple_bus.sv` releases OE ~37ns after real phi0 drops | §23.11 |
 
 ### 24.2 Key Observations
