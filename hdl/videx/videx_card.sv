@@ -315,10 +315,8 @@ module videx_card #(
     wire slot_rom_read = card_io_sel && a2bus_if.rw_n;
 
     // C8-space reads gated by phi0 and c8_owned directly (not io_strobe_n).
-    // io_strobe_n was tried but caused PR#3 hang because INTC8ROM was
-    // permanently set on ][+ (fixed by is_iie in apple_memory.sv).
-    // TODO: Consider switching to card_io_strobe now that is_iie prevents
-    // the INTC8ROM bug. This would add INTC8ROM protection for IIe support.
+    // io_strobe_n-based gating was tried but causes PR#3 hang due to
+    // SLOTROM timing mismatch (phi1_posedge update vs phi0 evaluation).
     wire exp_rom_read  = rom_c8_active && a2bus_if.phi0 && exp_rom_range && a2bus_if.rw_n;
 
     wire vram_read = rom_c8_active && a2bus_if.phi0 && vram_window && a2bus_if.rw_n;

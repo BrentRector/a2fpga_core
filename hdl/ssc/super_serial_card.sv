@@ -114,6 +114,8 @@ module SuperSerial #(
 
     assign APPLE_C0 = a2bus_if.addr[15:8] == 8'b11000000;
 
+    // phi0-qualified to prevent address bus transients during phi1 from
+    // spuriously clearing C8S2 (same fix pattern as videx_card.sv cfff_access)
     always @(posedge a2bus_if.clk_logic) begin
         if (!a2bus_if.system_reset_n) begin
             C8S2 <= 1'b0;
