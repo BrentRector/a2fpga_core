@@ -12,27 +12,27 @@
   <Part Number>: GW2AR-LV18QN88C8/I7
   <Device>: GW2AR-18
   <Device Version>: C
-  <Created Time>:Mon Feb 23 10:32:45 2026
+  <Created Time>:Mon Feb 23 20:20:07 2026
 
 
 2. PnR Details
 
   Running placement:
     Placement Phase 0: CPU time = 0h 0m 1s, Elapsed time = 0h 0m 1s
-    Placement Phase 1: CPU time = 0h 0m 0.258s, Elapsed time = 0h 0m 0.258s
+    Placement Phase 1: CPU time = 0h 0m 0.267s, Elapsed time = 0h 0m 0.267s
     Placement Phase 2: CPU time = 0h 0m 3s, Elapsed time = 0h 0m 3s
     Placement Phase 3: CPU time = 0h 0m 2s, Elapsed time = 0h 0m 2s
     Total Placement: CPU time = 0h 0m 6s, Elapsed time = 0h 0m 6s
  Running routing:
-    Routing Phase 0: CPU time = 0h 0m 0.002s, Elapsed time = 0h 0m 0.003s
-    Routing Phase 1: CPU time = 0h 0m 0.282s, Elapsed time = 0h 0m 0.282s
-    Routing Phase 2: CPU time = 0h 0m 5s, Elapsed time = 0h 0m 5s
+    Routing Phase 0: CPU time = 0h 0m 0.002s, Elapsed time = 0h 0m 0.002s
+    Routing Phase 1: CPU time = 0h 0m 0.287s, Elapsed time = 0h 0m 0.286s
+    Routing Phase 2: CPU time = 0h 0m 6s, Elapsed time = 0h 0m 6s
     Routing Phase 3: CPU time = 0h 0m 0s, Elapsed time = 0h 0m 0s
     Total Routing: CPU time = 0h 0m 6s, Elapsed time = 0h 0m 6s
  Generate output files:
     CPU time = 0h 0m 2s, Elapsed time = 0h 0m 2s
 
- Total Time and Memory Usage: CPU time = 0h 0m 14s, Elapsed time = 0h 0m 14s, Peak memory usage = 398MB
+ Total Time and Memory Usage: CPU time = 0h 0m 15s, Elapsed time = 0h 0m 15s, Peak memory usage = 397MB
 
 
 3. Resource Usage Summary
@@ -40,15 +40,15 @@
   ----------------------------------------------------------
   Resources                   | Usage
   ----------------------------------------------------------
-  Logic                       | 8641/20736  42%
-    --LUT,ALU,ROM16           | 7759(6521 LUT, 1238 ALU, 0 ROM16)
+  Logic                       | 8618/20736  42%
+    --LUT,ALU,ROM16           | 7736(6499 LUT, 1237 ALU, 0 ROM16)
     --SSRAM(RAM16)            | 147
-  Register                    | 4195/15750  27%
+  Register                    | 4268/15750  28%
     --Logic Register as Latch | 0/15552  0%
-    --Logic Register as FF    | 4175/15552  27%
+    --Logic Register as FF    | 4248/15552  28%
     --I/O Register as Latch   | 0/198  0%
     --I/O Register as FF      | 20/198  11%
-  CLS                         | 6166/10368  60%
+  CLS                         | 6180/10368  60%
   I/O Port                    | 36
   I/O Buf                     | 31
     --Input Buf               | 6
@@ -115,12 +115,12 @@
   clk_d          | PRIMARY        |  BL
   clk_logic_w    | PRIMARY        |  TR TL BR BL
   clk_pixel_w    | PRIMARY        |  TR TL BR BL
-  n869_5         | PRIMARY        |  TL
-  n948_7         | LW             |  -
+  n869_5         | PRIMARY        |  TL BL
+  n873_8         | LW             |  -
   n42_7          | LW             |  -
+  timer_a_count_15_7| LW             |  -
   reset_n_r      | LW             |  -
   n957_5         | LW             |  -
-  timer_a_count_15_7| LW             |  -
   pb_l_o[2]      | LW             |  -
   pb_r_o[2]      | LW             |  -
   n67_5          | LW             |  -

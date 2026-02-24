@@ -23,14 +23,17 @@
 //
 // Description:
 //
-// Combined Videx VideoTerm emulation providing:
+// Self-contained Videx VideoTerm emulation providing:
 //   - Firmware ROM (1 KB VideoTerm ROM 2.4 in distributed RAM)
 //   - MC6845 CRTC register file (R0-R15, all readable per HD6845SP Type 1)
 //   - 2 KB VRAM via GoWin SDPB primitive (8-bit write, 32-bit read)
 //   - C8-space ownership matching real Videx PAL16L8 behavior
-//   - a2mem_if VIDEX_* signals for the VIDEX_LINE renderer
+//   - Complete 80-column rendering pipeline (character ROM, cursor, color)
+//   - Video mux: outputs Videx pixels when active, passes through Apple video
 //
-// Follows the Mockingboard/SSC slot_if.card pattern.
+// Follows the SuperSprite video mux pattern: receives Apple video RGB in,
+// outputs either Videx-rendered or pass-through Apple video RGB out.
+// Follows the Mockingboard/SSC slot_if.card pattern for bus logic.
 // See VIDEX_IMPLEMENTATION_SPEC.md for complete hardware behavior spec.
 //
 // C8-Space Ownership:
@@ -45,11 +48,10 @@
 //
 // Mode Switching:
 //
-// VIDEX_MODE = card_enable (always active when card is configured in slot).
+// videx_active = card_enable && TEXT_MODE && AN0.
 // The 40/80-column switch is controlled by AN0 ($C058/$C059), matching
-// real Videx hardware and A2DVI. The rendering gate in apple_video.sv is:
-//   VIDEX_LINE active when (VIDEX_MODE && TEXT_MODE && AN0)
-// Ctrl-Reset clears AN0 via Autostart ROM ($FA6F), restoring 40-col mode.
+// real Videx hardware and A2DVI. Ctrl-Reset clears AN0 via Autostart ROM
+// ($FA6F), restoring 40-col mode.
 //
 
 module videx_card #(
@@ -57,17 +59,22 @@ module videx_card #(
     parameter bit ENABLE = 1'b1
 ) (
     a2bus_if.slave   a2bus_if,
-    a2mem_if.videx   a2mem_if,
+    a2mem_if.slave   a2mem_if,
     slot_if.card     slot_if,
 
     output [7:0]     data_o,
     output           rd_en_o,
     output           rom_en_o,
 
-    // Scanner VRAM read port (wired to apple_video VIDEX_LINE pipeline)
-    input [8:0]      videx_vram_addr_i,
-    input            videx_vram_rd_i,
-    output [31:0]    videx_vram_data_o
+    // Video chain: SuperSprite mux pattern
+    input wire [9:0] screen_x_i,
+    input wire [9:0] screen_y_i,
+    input [7:0]      apple_vga_r_i,
+    input [7:0]      apple_vga_g_i,
+    input [7:0]      apple_vga_b_i,
+    output [7:0]     videx_r_o,
+    output [7:0]     videx_g_o,
+    output [7:0]     videx_b_o
 );
 
     // ========================================================================
@@ -194,18 +201,6 @@ module videx_card #(
         end
     end
 
-    // Drive a2mem_if VIDEX signals for the VIDEX_LINE renderer.
-    // VIDEX_MODE = card_enable: card is always "in mode" when configured.
-    // The actual 40/80-col switch is controlled by AN0 in apple_video.sv.
-    assign a2mem_if.VIDEX_MODE     = card_enable;
-    assign a2mem_if.VIDEX_CRTC_R9  = {4'h0, crtc_regs[9][3:0]};
-    assign a2mem_if.VIDEX_CRTC_R10 = crtc_regs[10];
-    assign a2mem_if.VIDEX_CRTC_R11 = crtc_regs[11];
-    assign a2mem_if.VIDEX_CRTC_R12 = crtc_regs[12];
-    assign a2mem_if.VIDEX_CRTC_R13 = crtc_regs[13];
-    assign a2mem_if.VIDEX_CRTC_R14 = crtc_regs[14];
-    assign a2mem_if.VIDEX_CRTC_R15 = crtc_regs[15];
-
     // CRTC read: All R0-R15 readable (HD6845SP Type 1 / A2DVI behavior).
     // Even addr ($C0B0): address/status register -> always $00
     //   (Physical Videx returns $00 in VIDEX_DIAG T01, matching this)
@@ -231,12 +226,17 @@ module videx_card #(
     wire vram_we = !a2bus_if.rw_n && a2bus_if.data_in_strobe &&
                    rom_c8_active && vram_window;
 
+    // Scanner VRAM read signals (directly access SDPB read port)
+    // Declared here before use in the muxed read port logic.
+    reg [8:0] scanner_vram_addr;
+    reg scanner_vram_rd;
+
     // Muxed read port: scanner has priority.
     // cpu_vram_rd is phi0-qualified to prevent spurious reads during phi1
     // from corrupting the CPU hold register.
     wire cpu_vram_rd = rom_c8_active && a2bus_if.phi0 && vram_window && a2bus_if.rw_n;
-    wire [8:0]  vram_rd_addr = videx_vram_rd_i ? videx_vram_addr_i : vram_addr[10:2];
-    wire        vram_rd_en   = videx_vram_rd_i || cpu_vram_rd;
+    wire [8:0]  vram_rd_addr = scanner_vram_rd ? scanner_vram_addr : vram_addr[10:2];
+    wire        vram_rd_en   = scanner_vram_rd || cpu_vram_rd;
     wire [31:0] vram_rd_data;
 
     // GoWin SDPB primitive: 1 block for 2 KB VRAM
@@ -270,21 +270,19 @@ module videx_card #(
     reg cpu_rd_d1, cpu_rd_d2;
 
     always_ff @(posedge a2bus_if.clk_logic) begin
-        scanner_rd_d1 <= videx_vram_rd_i;
+        scanner_rd_d1 <= scanner_vram_rd;
         scanner_rd_d2 <= scanner_rd_d1;
-        cpu_rd_d1 <= cpu_vram_rd && !videx_vram_rd_i;
+        cpu_rd_d1 <= cpu_vram_rd && !scanner_vram_rd;
         cpu_rd_d2 <= cpu_rd_d1;
     end
 
-    // Scanner hold register: captures 32-bit word for apple_video
+    // Scanner hold register: captures 32-bit word for rendering pipeline
     reg [31:0] scanner_hold;
 
     always_ff @(posedge a2bus_if.clk_logic) begin
         if (scanner_rd_d2)
             scanner_hold <= vram_rd_data;
     end
-
-    assign videx_vram_data_o = scanner_hold;
 
     // CPU hold register: captures 32-bit word for CPU read-back
     reg [31:0] cpu_hold;
@@ -307,6 +305,264 @@ module videx_card #(
                                 vram_byte_sel_rr == 2'd1 ? cpu_hold[15:8] :
                                 vram_byte_sel_rr == 2'd2 ? cpu_hold[23:16] :
                                                            cpu_hold[31:24];
+
+    // ========================================================================
+    // Video Mode State (latched during blanking for stability)
+    // ========================================================================
+
+    localparam [9:0] SCREEN_WIDTH = 720;
+    localparam [9:0] SCREEN_HEIGHT = 480;
+
+    wire blanking_active_w = (screen_x_i > SCREEN_WIDTH) | (screen_y_i > SCREEN_HEIGHT);
+
+    reg text_mode_r;
+    reg an0_r;
+    reg [3:0] text_color_r;
+    reg [3:0] background_color_r;
+    reg [3:0] border_color_r;
+
+    // CRTC registers latched during blanking (from internal register file)
+    reg [7:0] videx_r10_r, videx_r11_r;
+    reg [7:0] videx_r12_r, videx_r13_r, videx_r14_r, videx_r15_r;
+
+    always @(posedge a2bus_if.clk_pixel) begin
+        if (blanking_active_w) begin
+            text_mode_r      <= a2mem_if.TEXT_MODE;
+            an0_r            <= a2mem_if.AN0;
+            text_color_r     <= a2mem_if.TEXT_COLOR;
+            background_color_r <= a2mem_if.BACKGROUND_COLOR;
+            border_color_r   <= a2mem_if.BORDER_COLOR;
+            videx_r10_r      <= crtc_regs[10];
+            videx_r11_r      <= crtc_regs[11];
+            videx_r12_r      <= crtc_regs[12];
+            videx_r13_r      <= crtc_regs[13];
+            videx_r14_r      <= crtc_regs[14];
+            videx_r15_r      <= crtc_regs[15];
+        end
+    end
+
+    wire videx_active = card_enable && text_mode_r && an0_r;
+
+    // ========================================================================
+    // Display Geometry
+    // ========================================================================
+
+    localparam [9:0] WINDOW_WIDTH = 560;
+    localparam [9:0] VIDEX_WINDOW_HEIGHT = 432;    // 9 scanlines x 24 rows x 2 (doubling)
+    localparam [9:0] H_BORDER = (SCREEN_WIDTH - WINDOW_WIDTH) / 2;   // 80
+    localparam [9:0] VIDEX_V_BORDER = (SCREEN_HEIGHT - VIDEX_WINDOW_HEIGHT) / 2;  // 24
+
+    localparam [9:0] H_LEFT_BORDER = H_BORDER - 1;
+    localparam [9:0] H_RIGHT_BORDER = H_BORDER + WINDOW_WIDTH;
+    localparam [9:0] VIDEX_V_TOP_BORDER = VIDEX_V_BORDER - 1;
+    localparam [9:0] VIDEX_V_BOTTOM_BORDER = VIDEX_V_BORDER + VIDEX_WINDOW_HEIGHT;
+
+    localparam STEP_LENGTH = 28;
+    localparam PIX_BUFFER_SIZE = STEP_LENGTH + 1;  // 29
+    localparam PIX_HISTORY_SIZE = 8;
+    localparam SCAN_PIX_OFFSET = STEP_LENGTH + PIX_HISTORY_SIZE - 4;  // 32
+
+    wire x_active_w = (screen_x_i > H_LEFT_BORDER) & (screen_x_i < H_RIGHT_BORDER);
+    wire y_active_w = (screen_y_i > VIDEX_V_TOP_BORDER) & (screen_y_i < VIDEX_V_BOTTOM_BORDER);
+    wire videx_pixel_active = videx_active & x_active_w & y_active_w;
+
+    wire scan_x_active_w = (screen_x_i > (H_LEFT_BORDER - SCAN_PIX_OFFSET)) & (screen_x_i < (H_RIGHT_BORDER - SCAN_PIX_OFFSET));
+    wire scan_active_w = scan_x_active_w & y_active_w;
+    wire scan_start_w = (screen_x_i == (H_LEFT_BORDER - SCAN_PIX_OFFSET)) & y_active_w;
+
+    // ========================================================================
+    // Videx Geometry Calculations
+    // ========================================================================
+
+    wire [10:0] videx_text_base_w = {videx_r12_r[2:0], videx_r13_r};
+    wire [10:0] videx_cursor_addr_w = {videx_r14_r[2:0], videx_r15_r};
+
+    // Content line after removing doubling: (screen_y - border) / 2, max 215
+    wire [9:0] videx_content_y_full_w = (screen_y_i - VIDEX_V_BORDER) >> 1;
+    wire [7:0] videx_content_y_w = (screen_y_i > VIDEX_V_TOP_BORDER) ?
+        videx_content_y_full_w[7:0] : 8'd0;
+
+    // Divide by 9: row = (content_y * 57) >> 9
+    wire [13:0] videx_div9_w = videx_content_y_w * 8'd57;
+    wire [4:0] videx_row_w = videx_div9_w[13:9];
+
+    // Scanline within row: content_y - row * 9
+    wire [7:0] videx_row_x9_w = {videx_row_w[4:0], 3'b0} + {3'b0, videx_row_w[4:0]};
+    wire [7:0] videx_scanline_full_w = videx_content_y_w - videx_row_x9_w;
+    wire [3:0] videx_scanline_w = videx_scanline_full_w[3:0];
+
+    // ========================================================================
+    // Character ROM (2 KB half-size, 128 chars x 16 scanlines)
+    // Chars 0x80-0xFF are inverse of 0x00-0x7F, generated by XOR at capture
+    // ========================================================================
+
+    reg [10:0] videxrom_a_r;
+    reg [7:0] videxrom_d_r;
+    reg [7:0] videxrom_r[2047:0];
+    initial $readmemh("videx_charrom.hex", videxrom_r, 0);
+    always @(posedge a2bus_if.clk_pixel) videxrom_d_r <= videxrom_r[videxrom_a_r];
+
+    // ========================================================================
+    // Cursor Logic
+    // ========================================================================
+
+    wire [1:0] videx_cursor_blink_mode_w = videx_r10_r[6:5];
+    wire [3:0] videx_cursor_start_line_w = videx_r10_r[3:0];
+    wire [3:0] videx_cursor_end_line_w = videx_r11_r[3:0];
+
+    reg videx_frame_edge_r;
+    reg [5:0] videx_frame_cnt_r;
+    always @(posedge a2bus_if.clk_pixel) begin
+        videx_frame_edge_r <= (screen_y_i >= SCREEN_HEIGHT);
+        if ((screen_y_i >= SCREEN_HEIGHT) && !videx_frame_edge_r)
+            videx_frame_cnt_r <= videx_frame_cnt_r + 1'b1;
+    end
+
+    wire videx_cursor_blink_w =
+        (videx_cursor_blink_mode_w == 2'b00) ? 1'b1 :
+        (videx_cursor_blink_mode_w == 2'b01) ? 1'b0 :
+        (videx_cursor_blink_mode_w == 2'b10) ? videx_frame_cnt_r[3] :
+        videx_frame_cnt_r[4];
+    wire videx_cursor_scanline_w = (videx_scanline_w >= videx_cursor_start_line_w) &&
+                                    (videx_scanline_w <= videx_cursor_end_line_w);
+
+    // ========================================================================
+    // Rendering Pipeline (28-step pixel cycle)
+    // ========================================================================
+
+    localparam [4:0] STEP_FIRST = 0;
+    localparam [4:0] STEP_LAST = STEP_LENGTH - 1;
+    localparam [4:0] STEP_LOAD_MEM = STEP_FIRST;
+    localparam [4:0] STEP_LATCH_MEM = 14;
+
+    reg [4:0] pix_step_r;
+    reg [5:0] h_offset_r;
+    reg [31:0] videx_data_r;
+    reg [PIX_BUFFER_SIZE-1:0] pix_buffer_r;
+    reg [PIX_BUFFER_SIZE-1:0] pix_shift_r /* synthesis syn_srlstyle = "registers" */;
+    wire pix_out_w = pix_shift_r[0];
+
+    // VRAM address computation
+    wire [10:0] videx_row_x80_w = ({videx_row_w, 6'd0}) + ({2'b0, videx_row_w, 4'd0});
+    wire [10:0] videx_line_start_w = (videx_text_base_w + videx_row_x80_w) & 11'h7FF;
+    wire [10:0] videx_char_addr_w = (videx_line_start_w + {4'b0, h_offset_r, 1'b0}) & 11'h7FF;
+
+    // Cursor matching
+    wire [10:0] videx_cursor_delta_w = (videx_cursor_addr_w - videx_char_addr_w) & 11'h7FF;
+    wire videx_cursor_in_group_w = videx_cursor_delta_w < 11'd4;
+    wire [1:0] videx_cursor_byte_w = videx_cursor_delta_w[1:0];
+    wire videx_cursor_active_w = videx_cursor_blink_w && videx_cursor_scanline_w && videx_cursor_in_group_w;
+
+    always @(posedge a2bus_if.clk_pixel) begin
+
+        pix_shift_r <= {1'b0, pix_shift_r[PIX_BUFFER_SIZE-1:1]};
+        scanner_vram_rd <= 1'b0;
+
+        if (scan_start_w) begin
+            pix_step_r <= '0;
+            h_offset_r <= '0;
+        end else if (videx_active) begin
+            pix_step_r <= (pix_step_r == STEP_LAST) ? 5'b0 : pix_step_r + 5'b1;
+        end
+
+        if (scan_active_w && videx_active) begin
+            case (pix_step_r)
+                // Issue VRAM read
+                STEP_LOAD_MEM: begin
+                    scanner_vram_addr <= videx_char_addr_w[10:2];
+                    scanner_vram_rd <= 1'b1;
+                end
+                // Latch VRAM data from scanner hold register
+                STEP_LATCH_MEM: begin
+                    videx_data_r <= scanner_hold;
+                    pix_buffer_r[28] <= 1'b0;
+                end
+                // Videx pipeline: 4 chars x 7 pixels = 28 pixels per cycle
+                // Stage 0: Issue ROM lookup for char 0
+                (STEP_LATCH_MEM + 5'd1): begin
+                    videxrom_a_r <= {videx_data_r[6:0], videx_scanline_w};
+                end
+                // Stage 1: Issue ROM lookup for char 1
+                (STEP_LATCH_MEM + 5'd2): begin
+                    videxrom_a_r <= {videx_data_r[14:8], videx_scanline_w};
+                end
+                // Stage 2: Capture char 0 pixels, issue ROM lookup for char 2
+                (STEP_LATCH_MEM + 5'd3): begin
+                    pix_buffer_r[6:0] <= videxrom_d_r[6:0] ^
+                        {7{videx_data_r[7] ^ (videx_cursor_active_w && videx_cursor_byte_w == 2'd0)}};
+                    videxrom_a_r <= {videx_data_r[22:16], videx_scanline_w};
+                end
+                // Stage 3: Capture char 1 pixels, issue ROM lookup for char 3
+                (STEP_LATCH_MEM + 5'd4): begin
+                    pix_buffer_r[13:7] <= videxrom_d_r[6:0] ^
+                        {7{videx_data_r[15] ^ (videx_cursor_active_w && videx_cursor_byte_w == 2'd1)}};
+                    videxrom_a_r <= {videx_data_r[30:24], videx_scanline_w};
+                end
+                // Stage 4: Capture char 2 pixels
+                (STEP_LATCH_MEM + 5'd5): begin
+                    pix_buffer_r[20:14] <= videxrom_d_r[6:0] ^
+                        {7{videx_data_r[23] ^ (videx_cursor_active_w && videx_cursor_byte_w == 2'd2)}};
+                end
+                // Stage 5: Capture char 3 pixels
+                (STEP_LATCH_MEM + 5'd6): begin
+                    pix_buffer_r[27:21] <= videxrom_d_r[6:0] ^
+                        {7{videx_data_r[31] ^ (videx_cursor_active_w && videx_cursor_byte_w == 2'd3)}};
+                end
+                // Load shift register
+                STEP_LAST: begin
+                    h_offset_r <= h_offset_r + 6'd2;
+                    pix_shift_r <= pix_buffer_r;
+                end
+            endcase
+        end
+    end
+
+    // ========================================================================
+    // Color Generation and Video Mux
+    // ========================================================================
+
+    wire GSP = a2bus_if.sw_gs;
+
+    reg [11:0] palette_rgb_r[0:31] = '{
+    // Apple II color palette for sRGB
+        12'h000, 12'h924, 12'h42a, 12'hd4e,
+        12'h064, 12'h888, 12'h39e, 12'hcbf,
+        12'h450, 12'hc73, 12'h888, 12'hfac,
+        12'h3c2, 12'hcd6, 12'h7ec, 12'hfff,
+    // Apple IIgs color palette
+        12'h000, 12'hd03, 12'h009, 12'hd2d,
+        12'h072, 12'h555, 12'h22f, 12'h6af,
+        12'h850, 12'hf60, 12'haaa, 12'hf98,
+        12'h1d0, 12'hff0, 12'h4f9, 12'hfff
+    };
+
+    // Pixel history for alignment with apple_video's pipeline delay
+    reg [PIX_HISTORY_SIZE-1:0] pix_history_r;
+
+    localparam HISTORY_PIXEL_OFFSET = 4;
+
+    reg [3:0] pix_color_r;
+
+    always @(posedge a2bus_if.clk_pixel) begin
+        pix_history_r <= {pix_out_w, pix_history_r[PIX_HISTORY_SIZE-1:1]};
+        pix_color_r <= background_color_r;
+        if (videx_pixel_active) begin
+            if (pix_history_r[HISTORY_PIXEL_OFFSET])
+                pix_color_r <= text_color_r;
+        end else begin
+            pix_color_r <= border_color_r;
+        end
+    end
+
+    wire [11:0] pix_rgb = palette_rgb_r[{GSP, pix_color_r}];
+    wire [3:0] pix_b = pix_rgb[3:0];
+    wire [3:0] pix_g = pix_rgb[7:4];
+    wire [3:0] pix_r = pix_rgb[11:8];
+
+    // Video mux: Videx pixels when active, pass-through Apple video otherwise
+    assign videx_r_o = videx_pixel_active ? {pix_r, 4'h0} : apple_vga_r_i;
+    assign videx_g_o = videx_pixel_active ? {pix_g, 4'h0} : apple_vga_g_i;
+    assign videx_b_o = videx_pixel_active ? {pix_b, 4'h0} : apple_vga_b_i;
 
     // ========================================================================
     // Read Response Signals

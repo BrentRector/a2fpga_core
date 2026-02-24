@@ -232,11 +232,6 @@ module top #(
     wire vgc_rd_w;
     wire [31:0] vgc_data_w;
 
-    // Videx VRAM read port (apple_video → videx_card)
-    wire [8:0] videx_vram_addr_w;
-    wire videx_vram_rd_w;
-    wire [31:0] videx_vram_data_w;
-
     apple_memory #(
         .VGC_MEMORY(1)
     ) apple_memory (
@@ -298,9 +293,7 @@ module top #(
     wire [7:0] apple_vga_g;
     wire [7:0] apple_vga_b;
 
-    apple_video #(
-        .VIDEX_SUPPORT(VIDEX_CARD_ENABLE)
-    ) apple_video (
+    apple_video apple_video (
         .a2bus_if(a2bus_if),
         .a2mem_if(a2mem_if),
 
@@ -317,11 +310,7 @@ module top #(
         .video_active_o(apple_vga_active),
         .video_r_o(apple_vga_r),
         .video_g_o(apple_vga_g),
-        .video_b_o(apple_vga_b),
-
-        .videx_vram_addr_o(videx_vram_addr_w),
-        .videx_vram_rd_o(videx_vram_rd_w),
-        .videx_vram_data_i(videx_vram_data_w)
+        .video_b_o(apple_vga_b)
     );
 
     wire [7:0] vgc_vga_r;
@@ -389,6 +378,11 @@ module top #(
     assign f18a_gpu_if.raddr = 13'b0;
     assign f18a_gpu_if.gstatus = 7'b0;
 
+    // Videx video chain output wires (declared before SuperSprite which consumes them)
+    wire [7:0] videx_vga_r_w;
+    wire [7:0] videx_vga_g_w;
+    wire [7:0] videx_vga_b_w;
+
     SuperSprite #(
         .ENABLE(SUPERSPRITE_ENABLE),
         .ID(SUPERSPRITE_ID),
@@ -403,9 +397,9 @@ module top #(
 
         .screen_x_i(hdmi_x),
         .screen_y_i(hdmi_y),
-        .apple_vga_r_i(vgc_vga_r),
-        .apple_vga_g_i(vgc_vga_g),
-        .apple_vga_b_i(vgc_vga_b),
+        .apple_vga_r_i(videx_vga_r_w),
+        .apple_vga_g_i(videx_vga_g_w),
+        .apple_vga_b_i(videx_vga_b_w),
         .apple_vga_active_i(apple_vga_active),
 
         .scanlines_i(SCANLINES_ENABLE | sw_scanlines_w),
@@ -493,24 +487,24 @@ module top #(
             .data_o(videx_d_w),
             .rd_en_o(videx_rd),
             .rom_en_o(videx_rom_en),
-            .videx_vram_addr_i(videx_vram_addr_w),
-            .videx_vram_rd_i(videx_vram_rd_w),
-            .videx_vram_data_o(videx_vram_data_w)
+            // Video chain: VGC → Videx → SuperSprite
+            .screen_x_i(hdmi_x),
+            .screen_y_i(hdmi_y),
+            .apple_vga_r_i(vgc_vga_r),
+            .apple_vga_g_i(vgc_vga_g),
+            .apple_vga_b_i(vgc_vga_b),
+            .videx_r_o(videx_vga_r_w),
+            .videx_g_o(videx_vga_g_w),
+            .videx_b_o(videx_vga_b_w)
         );
     end else begin : no_videx_card_gen
         assign videx_d_w = 8'b0;
         assign videx_rd = 1'b0;
         assign videx_rom_en = 1'b0;
-        assign videx_vram_data_w = 32'b0;
-        // Default VIDEX signals when card disabled
-        assign a2mem_if.VIDEX_MODE = 1'b0;
-        assign a2mem_if.VIDEX_CRTC_R9  = 8'h0;
-        assign a2mem_if.VIDEX_CRTC_R10 = 8'h0;
-        assign a2mem_if.VIDEX_CRTC_R11 = 8'h0;
-        assign a2mem_if.VIDEX_CRTC_R12 = 8'h0;
-        assign a2mem_if.VIDEX_CRTC_R13 = 8'h0;
-        assign a2mem_if.VIDEX_CRTC_R14 = 8'h0;
-        assign a2mem_if.VIDEX_CRTC_R15 = 8'h0;
+        // Pass through VGC output unchanged
+        assign videx_vga_r_w = vgc_vga_r;
+        assign videx_vga_g_w = vgc_vga_g;
+        assign videx_vga_b_w = vgc_vga_b;
     end endgenerate
 
     // Data output
