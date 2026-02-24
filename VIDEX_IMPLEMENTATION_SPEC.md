@@ -721,25 +721,53 @@ end else begin : no_videx_card_gen
 end endgenerate
 ```
 
-### 12.2a Video Chain
+### 12.2a Video Pipeline Architecture
 
-The video output flows through a cascading chain of optional multiplexers:
+The A2FPGA video system uses a **scan-line rendering pipeline** driven by the HDMI timing generator. The HDMI encoder outputs the current pixel coordinates (`hdmi_x`, `hdmi_y`), and every module in the pipeline renders its contribution for that pixel position on every `clk_pixel` cycle. The final RGB value flows through a cascading chain of optional multiplexers, each following the same contract:
 
 ```
-apple_video → VGC → Videx → SuperSprite → DebugOverlay → HDMI
+HDMI timing ──hdmi_x/y──┬─→ apple_video ─→ VGC ─→ Videx ─→ SuperSprite ─→ DebugOverlay ─→ HDMI encoder
+                         │        ↑          ↑       ↑          ↑              ↑
+                         └────────┴──────────┴───────┴──────────┴──────────────┘
+                              (all modules receive the same screen_x/y coordinates)
 ```
 
-Each stage receives RGB from the previous stage, optionally replaces it with its own content, and passes it along. The Videx card replaces Apple video with 80-column text when active; otherwise it passes through unchanged. SuperSprite's input comes from the Videx output:
+**The cascading mux contract**: Each stage receives 8-bit RGB from the previous stage, plus the shared `screen_x_i`/`screen_y_i` coordinates. If the stage is active and the current pixel is within its content window, it outputs its own rendered pixel. Otherwise, it passes through the input RGB unchanged. This means:
+
+- Only one stage "wins" for any given pixel — the last active stage in the chain
+- Disabled stages are transparent (zero latency, combinational passthrough)
+- The chain is order-dependent: later stages overlay earlier ones
+
+**Pipeline stages** (in `boards/a2n20v2/hdl/top.sv`):
+
+| Stage | Module | Input RGB | Output RGB | Function |
+|-------|--------|-----------|------------|----------|
+| 1 | `apple_video` | (none — generates) | `apple_vga_r/g/b` | Base Apple II video: text, lo-res, hi-res, double hi-res |
+| 2 | `vgc` | `apple_vga_r/g/b` | `vgc_vga_r/g/b` | Video Graphics Controller — IIgs-style super hi-res overlay |
+| 3 | `videx_card` | `vgc_vga_r/g/b` | `videx_vga_r/g/b_w` | Videx 80-column text replacement (this module) |
+| 4 | `SuperSprite` | `videx_vga_r/g/b_w` | `rgb_r/g/b_w` | TMS9918A/F18A VDP sprite/tile overlay + scanline effect |
+| 5 | `DebugOverlay` | `rgb_r/g/b_w` | `debug_r/g/b_w` | Optional diagnostic hex display (toggled by S2 button) |
+| 6 | `hdmi` | `debug_r/g/b_w` | TMDS | HDMI/DVI encoder → LVDS output buffers → connector |
+
+**Why Videx must be at position 3** (after VGC, before SuperSprite):
+
+- **After apple_video + VGC**: When Videx is active, it replaces the entire Apple II display (40-column text, graphics modes) with 80-column text. Videx must receive VGC output (not raw apple_video) because VGC may apply IIgs super hi-res rendering that should be the base when Videx is inactive. When Videx IS active, it replaces whatever VGC produced.
+- **Before SuperSprite**: The SuperSprite VDP provides a sprite/tile overlay that composites on top of the underlying video — whether that's Apple II native or Videx 80-column. A program could theoretically use both Videx text and SuperSprite sprites simultaneously. If Videx were after SuperSprite, it would obliterate the sprite layer.
+- **Before DebugOverlay**: The debug overlay must be last (before HDMI) so it's always visible regardless of which video modes are active.
+
+**Generate block passthrough**: When `VIDEX_CARD_ENABLE = 0`, the generate block's `else` clause provides combinational passthrough — the Videx output wires are directly assigned from the VGC output, adding zero logic and zero latency:
 
 ```systemverilog
-SuperSprite supersprite (
-    // ...
-    .apple_vga_r_i(videx_vga_r_w),    // was: vgc_vga_r
-    .apple_vga_g_i(videx_vga_g_w),    // was: vgc_vga_g
-    .apple_vga_b_i(videx_vga_b_w),    // was: vgc_vga_b
-    // ...
-);
+end else begin : no_videx_card_gen
+    assign videx_vga_r_w = vgc_vga_r;   // zero-cost passthrough
+    assign videx_vga_g_w = vgc_vga_g;
+    assign videx_vga_b_w = vgc_vga_b;
+end
 ```
+
+This ensures the pipeline works identically whether or not the Videx card is compiled in. SuperSprite always reads from `videx_vga_r/g/b_w` — it doesn't need to know whether Videx exists.
+
+**Wire declaration ordering**: The Videx output wires (`videx_vga_r/g/b_w`) must be declared before the SuperSprite instantiation that consumes them. In `top.sv`, these declarations appear at the top of the card instantiation section, before both the Videx generate block and the SuperSprite module.
 
 ### 12.3 Bus Multiplexer
 
