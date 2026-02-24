@@ -1,8 +1,10 @@
 # Videx VideoTerm 80-Column Card — Implementation Specification
 
-## Target: `videx_card.sv` for A2FPGA (Approach B)
+## Target: `videx_card.sv` — Standalone Video Mux Card
 
 This specification defines every hardware behavior the virtual Videx card module implements, derived from exhaustive analysis of the Videx VideoTerm ROM 2.4 firmware, MC6845 CRTC datasheet, and physical Videx hardware testing.
+
+**Architecture**: The card is a self-contained module following the SuperSprite video mux pattern. It owns all bus logic, CRTC registers, VRAM, character ROM, and the rendering pipeline. It receives Apple video RGB as input and outputs multiplexed RGB (Videx text when active, pass-through otherwise). The card inserts into the video chain between VGC and SuperSprite in `top.sv` — it does **not** patch into `apple_video.sv` or add signals to `a2mem_if`.
 
 ---
 
@@ -14,17 +16,22 @@ module videx_card #(
     parameter bit ENABLE = 1'b1
 ) (
     a2bus_if.slave   a2bus_if,
-    a2mem_if.videx   a2mem_if,       // videx modport: outputs VIDEX_* signals, reads INTCXROM/SLOTROM
+    a2mem_if.slave   a2mem_if,       // reads TEXT_MODE, AN0, INTCXROM, TEXT_COLOR, etc.
     slot_if.card     slot_if,        // slot system (same pattern as Mockingboard/SSC)
 
     output [7:0]     data_o,         // data driven onto bus for reads
     output           rd_en_o,        // active when card is driving data_o
     output           rom_en_o,       // C8 space ownership status (exported for status)
 
-    // Scanner VRAM read port (wired to apple_video VIDEX_LINE pipeline)
-    input [8:0]      videx_vram_addr_i,
-    input            videx_vram_rd_i,
-    output [31:0]    videx_vram_data_o
+    // Video chain: SuperSprite mux pattern (input from VGC, output to SuperSprite)
+    input wire [9:0] screen_x_i,    // current pixel X coordinate
+    input wire [9:0] screen_y_i,    // current pixel Y coordinate
+    input [7:0]      apple_vga_r_i, // Apple video RGB from previous stage (VGC)
+    input [7:0]      apple_vga_g_i,
+    input [7:0]      apple_vga_b_i,
+    output [7:0]     videx_r_o,     // multiplexed RGB output (to next stage)
+    output [7:0]     videx_g_o,
+    output [7:0]     videx_b_o
 );
 ```
 
@@ -32,11 +39,13 @@ The card follows the same `slot_if.card` pattern as `Mockingboard` and `SuperSer
 - `ID` parameter: unique card identifier (5 = Videx), matched against `slots.hex` assignment
 - `ENABLE` parameter: compile-time enable (card synthesizes away when 0)
 - `slot_if.card` modport provides: `slot`, `card_id`, `io_select_n`, `dev_select_n`, `io_strobe_n`, `config_select_n`, `card_config`, `card_enable`
-- `a2mem_if.videx` modport: outputs `VIDEX_MODE` and `VIDEX_CRTC_R9`–`R15`, reads `INTCXROM` and `SLOTROM`
+- `a2mem_if.slave` modport: reads `TEXT_MODE`, `AN0` (mode detection), `INTCXROM` (C8 ownership), `TEXT_COLOR`/`BACKGROUND_COLOR`/`BORDER_COLOR` (color generation). No Videx-specific signals added to `a2mem_if`.
 - `rom_en_o`: expansion ROM ownership flag (exported for status, not consumed by top.sv)
-- Scanner VRAM port: the `VIDEX_LINE` pipeline in `apple_video.sv` reads VRAM through the card's 32-bit read port, eliminating the need for a separate shadow VRAM copy
+- Video chain ports: the card receives Apple video RGB from the previous stage (VGC) and outputs multiplexed RGB to the next stage (SuperSprite). When Videx mode is active (80-column text), the card renders its own pixels; otherwise it passes through the input RGB unchanged. This follows the same pattern as `SuperSprite` and `vgc`.
 
 The card does **not** generate interrupts (`irq_n` is not needed — the real Videx had no IRQ).
+
+The card is **fully self-contained**: CRTC registers, VRAM, character ROM, rendering pipeline, cursor logic, and color generation are all internal. No rendering code exists in `apple_video.sv`, and no Videx-specific signals exist in `a2mem_if`.
 
 ---
 
@@ -214,25 +223,25 @@ Five CRTC registers differ between the two variants:
 
 ### 4.5 Which Registers the Renderer Uses
 
-The existing `VIDEX_LINE` renderer in `apple_video.sv` reads these via `a2mem_if`:
+The internal rendering pipeline reads these CRTC registers directly from the card's register array:
 
-| Register | Signal | Renderer Use |
-|----------|--------|-------------|
-| R9[3:0]  | `VIDEX_CRTC_R9` | Max scanline (character height - 1) |
-| R10      | `VIDEX_CRTC_R10` | Cursor start line + blink mode |
-| R11      | `VIDEX_CRTC_R11` | Cursor end line |
-| R12      | `VIDEX_CRTC_R12` | Display start address high (hardware scroll) |
-| R13      | `VIDEX_CRTC_R13` | Display start address low |
-| R14      | `VIDEX_CRTC_R14` | Cursor position high |
-| R15      | `VIDEX_CRTC_R15` | Cursor position low |
+| Register | Renderer Use |
+|----------|-------------|
+| R9[3:0]  | Max scanline (character height - 1) |
+| R10      | Cursor start line + blink mode |
+| R11      | Cursor end line |
+| R12      | Display start address high (hardware scroll) |
+| R13      | Display start address low |
+| R14      | Cursor position high |
+| R15      | Cursor position low |
 
-R0–R8 define CRT timing that is irrelevant to HDMI rendering. They must be stored (for R14/R15 read-back indexing to work) but are not forwarded to the renderer.
+R0–R8 define CRT timing that is irrelevant to HDMI rendering. They must be stored (for R14/R15 read-back indexing to work) but are not used by the renderer.
 
 ### 4.6 Driving the Renderer
 
-The card drives CRTC register values to the `VIDEX_LINE` rendering pipeline via `a2mem_if.videx` modport signals (`VIDEX_CRTC_R9` through `VIDEX_CRTC_R15`). These are assigned directly from the card's internal register array whenever register writes occur.
+The rendering pipeline accesses CRTC registers directly from the internal register array (`crtc_regs[0:15]`). No signals are exported via `a2mem_if`. The renderer latches the display-critical registers (R10–R15) during video blanking for stability, the same way `apple_video.sv` latches mode switches.
 
-`VIDEX_MODE` is driven by `card_enable` — the card is always "in mode" when configured in its slot. The `VIDEX_LINE` pipeline activates when `VIDEX_MODE && TEXT_MODE && AN0`.
+The Videx display mode is active when `card_enable && TEXT_MODE && AN0`. `TEXT_MODE` and `AN0` are read from `a2mem_if` via the `slave` modport (read-only, no interface changes). `card_enable` is the standard slot_if.card pattern flag.
 
 ---
 
@@ -280,7 +289,7 @@ When the CPU writes to `$CC00–$CDFF` and the expansion ROM ownership flag is s
 vram[{bank_sel, addr[8:0]}] <= data_in;
 ```
 
-The card's VRAM SDPB block has a 32-bit read port wired to the `VIDEX_LINE` rendering pipeline for scanner access (4 characters per read cycle).
+The card's VRAM SDPB block has a 32-bit read port shared between the internal rendering scanner (4 characters per read cycle) and CPU read-back.
 
 ### 5.5 Read Path
 
@@ -317,11 +326,11 @@ A single GoWin SDPB primitive provides both CPU read-back and scanner access thr
 
 The asymmetric port widths (BIT_WIDTH_0=8 write, BIT_WIDTH_1=32 read) use exactly **1 SDPB block** for the full 2 KB — avoiding the 4-block byte_enable splitting penalty of `sdpram32`.
 
-The read port is shared between the `VIDEX_LINE` scanner pipeline (via `videx_vram_addr_i`/`videx_vram_rd_i`/`videx_vram_data_o`) and CPU reads. Scanner has priority. A 2-cycle SDPB pipeline feeds separate hold registers:
-- **Scanner hold** (32-bit): captures 4-character word for `apple_video.sv`
+The read port is shared between the internal rendering scanner and CPU reads. Scanner has priority. A 2-cycle SDPB pipeline feeds separate hold registers:
+- **Scanner hold** (32-bit): captures 4-character word for the rendering pipeline
 - **CPU hold** (32-bit): captures word, then byte-selected via `vram_addr[1:0]` pipeline
 
-The previous shadow VRAM in `apple_memory.sv` has been removed. The card's VRAM is the sole copy.
+Both the scanner and CPU read paths are internal to `videx_card.sv`.
 
 **Cost**: 1 SDPB block (2 KB).
 
@@ -460,7 +469,7 @@ The Videx firmware uses AN0 to signal 80-column mode:
 | `$C058` | AN0 OFF → 40-column mode | `CTRL-Z` + `'1'` (exit to 40-col) |
 | `$C059` | AN0 ON → 80-column mode | Initialization; **every character output** |
 
-The card does **not** need to handle AN0 directly. The existing soft switch capture in `apple_memory.sv` already tracks `SWITCHES_II[4]` (AN0) when the CPU accesses `$C058/$C059`. The `VIDEX_LINE` renderer activates when `videx_mode_r && text_mode_r && an0_r`.
+The card does **not** need to handle AN0 directly. The existing soft switch capture in `apple_memory.sv` already tracks `SWITCHES_II[4]` (AN0) when the CPU accesses `$C058/$C059`. The card reads `AN0` from `a2mem_if.slave` and the rendering pipeline activates when `card_enable && text_mode_r && an0_r`.
 
 **Key detail**: The Videx firmware writes `STA $C059` on **every single character output** (`OUTPT1` at `$CA8F`), re-asserting AN0. This ensures the display stays in 80-column mode even if something else toggled AN0.
 
@@ -471,7 +480,7 @@ The card architecture supports a passive shadow rendering mode for use with a ph
 - **Physical Videx** in slot 3 drives the Apple II bus (firmware ROM, CRTC, VRAM)
 - **A2FPGA** in another physical slot (typically slot 7) with the Videx card module configured for slot 3
 
-The FPGA card snoops all bus writes to slot 3 addresses — CRTC register writes (`$C0B0/$C0B1`), VRAM writes (`$CC00–$CDFF`), and soft switch accesses (`$C058/$C059`) — without driving the bus (`rd_en_o=0`, `rom_en_o=0`). The `VIDEX_LINE` pipeline renders the snooped data on HDMI output, providing a digital display for a physical Videx card that only has composite video output.
+The FPGA card snoops all bus writes to slot 3 addresses — CRTC register writes (`$C0B0/$C0B1`), VRAM writes (`$CC00–$CDFF`), and soft switch accesses (`$C058/$C059`) — without driving the bus (`rd_en_o=0`, `rom_en_o=0`). The rendering pipeline renders the snooped data on HDMI output, providing a digital display for a physical Videx card that only has composite video output.
 
 This mode was used during development to verify the rendering pipeline independently from bus response logic. To enable shadow mode, disable the `rd_en_o` and `rom_en_o` assignments in `videx_card.sv`.
 
@@ -509,7 +518,7 @@ vram_byte = {FLAGS.bit0, ascii_char[6:0]}
 - Bit 7: 0 = normal, 1 = inverse (from FLAGS bit 0)
 - Bits [6:0]: ASCII character code (7-bit, e.g., `$41` = 'A')
 
-The character ROM stores only 128 normal characters (2 KB). The ROM is addressed as `{vram_byte[6:0], scanline[3:0]}` (11-bit address into 2 KB ROM). Inverse characters (vram bit 7 = 1) are rendered by XOR-inverting the normal character's pixel data at capture time in the `VIDEX_LINE` pipeline, saving 1 BSRAM block.
+The character ROM stores only 128 normal characters (2 KB). The ROM is addressed as `{vram_byte[6:0], scanline[3:0]}` (11-bit address into 2 KB ROM). Inverse characters (vram bit 7 = 1) are rendered by XOR-inverting the normal character's pixel data at capture time in the rendering pipeline, saving 1 BSRAM block.
 
 Only scanlines 0–8 are displayed (R9 = 8). Each character cell is 7 pixels wide. Scanlines 9–15 in the ROM are padding.
 
@@ -653,7 +662,7 @@ if rom_c8_active && phi0 && exp_rom_range && rw_n:
 
 ### Renderer Interface
 
-The card **directly drives** `a2mem_if.VIDEX_CRTC_R*` and `VIDEX_MODE` signals via the `a2mem_if.videx` modport. The card is the sole owner of all Videx state. The scanner VRAM read port is wired directly to the `VIDEX_LINE` pipeline in `apple_video.sv`.
+The card contains the complete rendering pipeline internally. CRTC registers are accessed directly within the module — no signals are exported via `a2mem_if`. The VRAM SDPB read port is shared between the internal rendering scanner and CPU read-back, with the scanner having priority. The rendering pipeline produces pixel-level RGB output that is multiplexed with the input Apple video (see §13).
 
 ---
 
@@ -661,28 +670,27 @@ The card **directly drives** `a2mem_if.VIDEX_CRTC_R*` and `VIDEX_MODE` signals v
 
 ### 12.1 Parameters
 
-Add to `boards/a2n20v2/hdl/top.sv` module parameters:
+In `boards/a2n20v2/hdl/top.sv`:
 
 ```systemverilog
 parameter bit VIDEX_CARD_ENABLE = 1,
 parameter bit [7:0] VIDEX_CARD_ID = 5,
 ```
 
-Couple `VIDEX_SUPPORT` with `VIDEX_CARD_ENABLE` — the rendering pipeline requires the card module:
-
-```systemverilog
-apple_memory #(.VGC_MEMORY(1), .VIDEX_SUPPORT(VIDEX_CARD_ENABLE)) apple_memory (...);
-apple_video  #(.VIDEX_SUPPORT(VIDEX_CARD_ENABLE)) apple_video (...);
-```
+The card is fully self-contained — no `VIDEX_SUPPORT` parameter on `apple_video` or `apple_memory`. Those modules have no knowledge of Videx.
 
 ### 12.2 Instantiation
 
-The card follows the same `slot_if.card` pattern as Mockingboard and SSC. It is gated by a generate block:
+The card follows the same `slot_if.card` pattern as Mockingboard and SSC. It is gated by a generate block and wired into the video chain:
 
 ```systemverilog
 wire [7:0] videx_d_w;
 wire videx_rd;
 wire videx_rom_en;
+
+wire [7:0] videx_vga_r_w;
+wire [7:0] videx_vga_g_w;
+wire [7:0] videx_vga_b_w;
 
 generate if (VIDEX_CARD_ENABLE) begin : videx_card_gen
     videx_card #(.ENABLE(VIDEX_CARD_ENABLE), .ID(VIDEX_CARD_ID)) videx (
@@ -692,16 +700,45 @@ generate if (VIDEX_CARD_ENABLE) begin : videx_card_gen
         .data_o(videx_d_w),
         .rd_en_o(videx_rd),
         .rom_en_o(videx_rom_en),
-        // Scanner VRAM port (wired to apple_video VIDEX_LINE pipeline)
-        .videx_vram_addr_i(videx_vram_addr),
-        .videx_vram_rd_i(videx_vram_rd),
-        .videx_vram_data_o(videx_vram_data)
+        // Video chain: VGC → Videx → SuperSprite
+        .screen_x_i(hdmi_x),
+        .screen_y_i(hdmi_y),
+        .apple_vga_r_i(vgc_vga_r),
+        .apple_vga_g_i(vgc_vga_g),
+        .apple_vga_b_i(vgc_vga_b),
+        .videx_r_o(videx_vga_r_w),
+        .videx_g_o(videx_vga_g_w),
+        .videx_b_o(videx_vga_b_w)
     );
 end else begin : no_videx_card_gen
     assign videx_d_w = 8'b0;
     assign videx_rd = 1'b0;
     assign videx_rom_en = 1'b0;
+    // Pass through VGC output unchanged when Videx disabled
+    assign videx_vga_r_w = vgc_vga_r;
+    assign videx_vga_g_w = vgc_vga_g;
+    assign videx_vga_b_w = vgc_vga_b;
 end endgenerate
+```
+
+### 12.2a Video Chain
+
+The video output flows through a cascading chain of optional multiplexers:
+
+```
+apple_video → VGC → Videx → SuperSprite → DebugOverlay → HDMI
+```
+
+Each stage receives RGB from the previous stage, optionally replaces it with its own content, and passes it along. The Videx card replaces Apple video with 80-column text when active; otherwise it passes through unchanged. SuperSprite's input comes from the Videx output:
+
+```systemverilog
+SuperSprite supersprite (
+    // ...
+    .apple_vga_r_i(videx_vga_r_w),    // was: vgc_vga_r
+    .apple_vga_g_i(videx_vga_g_w),    // was: vgc_vga_g
+    .apple_vga_b_i(videx_vga_b_w),    // was: vgc_vga_b
+    // ...
+);
 ```
 
 ### 12.3 Bus Multiplexer
@@ -730,21 +767,27 @@ The slotmaker module reads this file at initialization, configures slot 3 with c
 
 ## 13. Rendering Path
 
-The `VIDEX_LINE` pipeline in `apple_video.sv` handles all rendering. Summary of what it does:
+The rendering pipeline is entirely self-contained within `videx_card.sv`. It replicates the timing structure of `apple_video.sv`'s pixel pipeline (28-step cycle, shift register) but handles only Videx 80-column text mode. The `apple_video.sv` module has no knowledge of Videx.
 
 ### 13.1 Mode Activation
 
+The card determines whether to render Videx output or pass through Apple video:
+
 ```systemverilog
-wire line_type_w = (videx_mode_r & text_mode_r & an0_r) ? VIDEX_LINE : ...;
+wire videx_active = card_enable && text_mode_r && an0_r;
 ```
 
-`videx_mode_r` is driven by `a2mem_if.VIDEX_MODE`, which the card sets to `card_enable` (always active when configured). `text_mode_r` and `an0_r` come from soft switches.
+`text_mode_r` and `an0_r` are latched from `a2mem_if.TEXT_MODE` and `a2mem_if.AN0` (read via the `slave` modport) during video blanking for stability. `card_enable` is the standard slot_if.card pattern flag.
+
+When `videx_active` is false, the video output ports pass through the input Apple video RGB unchanged.
 
 ### 13.2 Display Geometry
 
 - 80 columns × 24 rows × 9 scanlines = 560 × 216 active pixels
 - Doubled to 560 × 432 for HDMI output within 720 × 480 frame
 - V border = 24 pixels each side (vs. 48 for standard Apple II text)
+
+The Videx content window (432 lines) is taller than the Apple text window (384 lines). In the extended border areas (lines 24–47 and 432–455), Apple video outputs border color but Videx renders text content. The video mux replaces these pixels when Videx is active.
 
 ### 13.3 VRAM Address for Rendering
 
@@ -753,9 +796,11 @@ row_start = (text_base + row × 80) mod 2048
 char_addr = (row_start + column) mod 2048
 ```
 
-Where `text_base = {R12[2:0], R13[7:0]}`. This is the 11-bit circular buffer address.
+Where `text_base = {R12[2:0], R13[7:0]}` from the internal CRTC register file. This is the 11-bit circular buffer address. The VRAM SDPB read port is shared between the rendering scanner (priority) and CPU read-back, using the same mux/hold-register mechanism as before — now entirely internal to the card.
 
 ### 13.4 Character ROM Lookup
+
+The 2 KB half-size character ROM (`videx_charrom.hex`) is instantiated inside `videx_card.sv`:
 
 ```
 rom_addr = {vram_byte[6:0], scanline[3:0]}   // 11-bit address into 2 KB ROM
@@ -766,7 +811,7 @@ The ROM stores only normal characters (0x00–0x7F). Inverse characters use the 
 
 ### 13.5 Cursor Rendering
 
-Cursor position: `{R14[2:0], R15[7:0]}` (11-bit VRAM address).
+Cursor position: `{R14[2:0], R15[7:0]}` (11-bit VRAM address, from internal CRTC registers).
 Blink mode from R10[6:5]: `00`=always on, `01`=hidden, `10`=1/16 field rate, `11`=1/32 field rate.
 Scanline range: R10[3:0] (start) to R11[3:0] (end).
 
@@ -776,36 +821,74 @@ pixel_out = rom_data[6:0] ^ {7{vram_byte[7] ^ cursor_active}}
 ```
 This means: normal char + no cursor = normal pixels, inverse char + no cursor = inverted pixels, normal char + cursor = inverted pixels, inverse char + cursor = normal pixels (double inversion cancels).
 
+### 13.6 Video Multiplexer Output
+
+The card outputs pixel-level multiplexed RGB using the SuperSprite pattern:
+
+```systemverilog
+assign videx_r_o = videx_pixel_active ? videx_rgb_r : apple_vga_r_i;
+assign videx_g_o = videx_pixel_active ? videx_rgb_g : apple_vga_g_i;
+assign videx_b_o = videx_pixel_active ? videx_rgb_b : apple_vga_b_i;
+```
+
+`videx_pixel_active` is true when `videx_active` (mode is on) AND the current pixel is within the Videx content window (560 × 432).
+
+### 13.7 Color Generation
+
+The card includes the Apple II/IIgs color palette (same 32-entry table as `apple_video.sv`) and uses `TEXT_COLOR` / `BACKGROUND_COLOR` / `BORDER_COLOR` from `a2mem_if` for colorization:
+
+- Pixel on → `TEXT_COLOR` → palette lookup → 8-bit RGB
+- Pixel off → `BACKGROUND_COLOR` → palette lookup → 8-bit RGB
+- Outside content window → pass-through Apple video (which already has border color)
+
+This matches the current rendering behavior and respects IIgs color settings.
+
 ---
 
 ## 14. BSRAM Budget
 
 Baseline (no Videx): 41/46 blocks used (89%), 5 free.
 
-| New Component | Type | BSRAM Blocks |
-|--------------|------|-------------|
-| Firmware ROM (1 KB) | Distributed RAM (LUTs), annotated `syn_ramstyle="distributed_ram"` | 0–1 |
-| Character ROM (2 KB, halved from 4 KB) | pROM | 1 |
-| VRAM (2 KB, GoWin SDPB asymmetric 8-bit write / 32-bit read) | SDPB | 1 |
-| **Total Videx** | | **3** |
-| **Total with Videx** | | **44/46** |
-| **Remaining free** | | **2** |
+| Component | Location | Type | BSRAM Blocks |
+|-----------|----------|------|-------------|
+| Firmware ROM (1 KB) | `videx_card.sv` | Distributed RAM (LUTs), annotated `syn_ramstyle="distributed_ram"` | 0–1 |
+| Character ROM (2 KB, halved from 4 KB) | `videx_card.sv` | pROM | 1 |
+| VRAM (2 KB, GoWin SDPB asymmetric 8-bit write / 32-bit read) | `videx_card.sv` | SDPB | 1 |
+| **Total Videx** | | | **3** |
+| **Total with Videx** | | | **44/46** |
+| **Remaining free** | | | **2** |
 
-The character ROM halving (§9 — chars `$80–$FF` are inverse of `$00–$7F`, XOR at capture in VIDEX_LINE) saves 1 BSRAM block vs. a full 4 KB charrom. The VRAM uses a single SDPB block with asymmetric port widths instead of the 4 blocks that `sdpram32` with byte_enable would consume.
+All Videx BSRAM resources are inside `videx_card.sv`. The character ROM halving (§9 — chars `$80–$FF` are inverse of `$00–$7F`, XOR at capture) saves 1 BSRAM block vs. a full 4 KB charrom. The VRAM uses a single SDPB block with asymmetric port widths instead of the 4 blocks that `sdpram32` with byte_enable would consume.
 
 ---
 
 ## 15. Files to Create/Modify
 
-| File | Action | Description |
-|------|--------|-------------|
-| `hdl/videx/videx_card.sv` | **Create** | Virtual card module (~300 lines), follows Mockingboard/SSC `slot_if.card` pattern |
-| `hdl/videx/videx_rom.hex` | **Exists** | Videx VideoTerm ROM 2.4 image (1 KB, hex format) — already created |
-| `boards/a2n20v2/hdl/top.sv` | **Modify** | Add `VIDEX_CARD_ENABLE`/`VIDEX_CARD_ID` params, instantiate card, wire to bus mux, couple `VIDEX_SUPPORT` with `VIDEX_CARD_ENABLE` |
-| `hdl/slots/slots.hex` | **Modify** | Assign Videx card ID 5 to slot 3 |
-| `hdl/memory/apple_memory.sv` | **Modify** | Add `is_iie` runtime detection, fix INTC8ROM logic for Apple ][+ |
-| `hdl/video/apple_video.sv` | **Modify** | Add `VIDEX_LINE` rendering pipeline with charrom halving (XOR inversion) |
-| `hdl/memory/a2mem_if.sv` | **Modify** | Add `videx` modport, VIDEX_MODE and VIDEX_CRTC_R9–R15 signals |
+### 15.1 Refactoring Checklist (Standalone Card Architecture)
+
+This checklist tracks progress on the refactor from the patched-video architecture to the standalone SuperSprite-pattern architecture. Each item represents an atomic change.
+
+| # | File | Action | Description | Status |
+|---|------|--------|-------------|--------|
+| 1 | `hdl/memory/a2mem_if.sv` | **Modify** | Remove `VIDEX_MODE`, `VIDEX_CRTC_R9`–`R15` declarations; remove from `slave` modport; delete `videx` modport | Pending |
+| 2 | `hdl/video/apple_video.sv` | **Modify** | Remove `VIDEX_SUPPORT` param, Videx ports, charrom, `VIDEX_LINE` pipeline, geometry, cursor logic — restore to upstream-clean state | Pending |
+| 3 | `hdl/videx/videx_card.sv` | **Rewrite** | Add rendering pipeline, charrom, video mux, color generation; change `a2mem_if.videx` → `a2mem_if.slave`; remove scanner VRAM external ports; add video chain I/O ports | Pending |
+| 4 | `boards/a2n20v2/hdl/top.sv` | **Modify** | Remove VIDEX_SUPPORT from apple_video; rewire videx_card with video chain ports; chain VGC → Videx → SuperSprite; remove VIDEX_* stub assignments | Pending |
+| 5 | `boards/a2n20v1/hdl/top.sv` | **Modify** | Remove `VIDEX_SUPPORT(0)` from apple_video, remove Videx stub ports, remove `a2mem_if.VIDEX_*` assignments | Pending |
+| 6 | `boards/a2n20v2-Enhanced/hdl/top.sv` | **Modify** | Same as #5 | Pending |
+| 7 | `boards/a2mega/hdl/top.sv` | **Modify** | Same as #5 | Pending |
+| 8 | `boards/a2n9/hdl/top.sv` | **Modify** | Same as #5 | Pending |
+| 9 | `boards/a2p25/hdl/top.sv` | **Modify** | Same as #5 | Pending |
+
+### 15.2 Existing Files (Unchanged)
+
+| File | Description |
+|------|-------------|
+| `hdl/videx/videx_rom.hex` | Videx VideoTerm ROM 2.4 image (1 KB, hex format) |
+| `hdl/video/videx_charrom.hex` | Videx character ROM (2 KB, half-size) |
+| `hdl/slots/slots.hex` | Slot assignment (card_id=5 in slot 3) |
+| `hdl/memory/apple_memory.sv` | `is_iie` runtime detection + INTC8ROM fix (already done) |
+| `hdl/ssc/super_serial_card.sv` | C8S2 phi0 qualification fix (already done) |
 
 ---
 
@@ -2232,7 +2315,7 @@ rom_addr[10:0] = {vram_byte[6:0], scanline[3:0]}
 - **Bits [10:4]** = Character code (7-bit ASCII, from VRAM bits [6:0])
 - **Bits [3:0]** = Scanline within the character cell (0–8 displayed, 9–15 padding)
 
-This gives 128 character entries × 16 scanlines each = 2048 bytes loaded. VRAM bit 7 (inverse flag) is not part of the ROM address — inverse rendering is handled by XOR inversion at pixel capture time in the `VIDEX_LINE` pipeline (§13.5).
+This gives 128 character entries × 16 scanlines each = 2048 bytes loaded. VRAM bit 7 (inverse flag) is not part of the ROM address — inverse rendering is handled by XOR inversion at pixel capture time in the rendering pipeline (§13.5).
 
 Each character occupies 16 consecutive bytes. With R9 = 8 (9 scanlines per row), only bytes at offsets 0–8 within each character are displayed. Bytes at offsets 9–15 are padding.
 
@@ -2556,6 +2639,32 @@ assign a2_bridge_bus_d_oe_n_o = ~(data_out_en_i & BUS_DATA_OUT_ENABLE & ~oe_earl
 ```
 
 **Status**: Verified. Pascal 1.3 boots 100% with all emulated cards enabled. OE_MARGIN=2 confirmed correct.
+
+### 23.12 Standalone Card Refactor (SuperSprite Video Mux Pattern)
+
+**Motivation**: Upstream maintainer feedback — the Videx implementation should follow the SuperSprite pattern as a standalone virtual card that multiplexes into the video output stream, rather than patching into `apple_video.sv` or modifying `a2mem_if`.
+
+**Previous architecture**: Rendering was split across two modules. `videx_card.sv` owned CRTC registers, VRAM, and firmware ROM. `apple_video.sv` owned the `VIDEX_LINE` rendering pipeline (charrom, pixel generation, cursor logic). They were connected via `a2mem_if.VIDEX_*` signals (8 CRTC register exports + VIDEX_MODE) and a VRAM scanner read port wired through `top.sv`.
+
+**New architecture**: All Videx logic consolidated in `videx_card.sv`. The card receives Apple video RGB as input and outputs multiplexed RGB, inserting into the video chain between VGC and SuperSprite in `top.sv`. No changes to `a2mem_if` — the card reads standard signals via the `slave` modport. No changes to `apple_video.sv` — it has no knowledge of Videx.
+
+**What moved into `videx_card.sv`**:
+- Character ROM (2 KB half-size, `videx_charrom.hex`) — was in `apple_video.sv` generate block
+- Rendering pipeline (28-step cycle, shift register, VIDEX_LINE stages) — was in `apple_video.sv`
+- Cursor logic (blink, scanline range, position matching) — was in `apple_video.sv`
+- Videx geometry constants (432-line window, borders) — was in `apple_video.sv`
+- VRAM address computation (row × 80 linear addressing) — was in `apple_video.sv`
+- Color generation (palette table, text_color/background_color) — was in `apple_video.sv`
+- Video mux (pixel-level: Videx RGB vs pass-through Apple RGB) — new
+
+**What was removed**:
+- `a2mem_if.sv`: `VIDEX_MODE`, `VIDEX_CRTC_R9`–`R15` signal declarations; `videx` modport; VIDEX signals from `slave` modport
+- `apple_video.sv`: `VIDEX_SUPPORT` parameter; Videx charrom; `VIDEX_LINE` pipeline stages; Videx geometry; VRAM read port; all Videx-specific rendering code
+- `top.sv` (all boards): `VIDEX_SUPPORT` coupling; scanner VRAM wires; `a2mem_if.VIDEX_*` stub assignments
+
+**What was unchanged**: Bus logic, CRTC register file, VRAM SDPB, firmware ROM, C8 ownership protocol, address decoding — all remain in `videx_card.sv` as before. BSRAM cost unchanged (44/46 blocks).
+
+**Status**: Pending — see §15.1 for per-file refactoring checklist.
 
 ---
 
