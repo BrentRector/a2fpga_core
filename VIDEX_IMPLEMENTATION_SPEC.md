@@ -749,10 +749,11 @@ HDMI timing ──hdmi_x/y──┬─→ apple_video ─→ VGC ─→ Videx �
 | 5 | `DebugOverlay` | `rgb_r/g/b_w` | `debug_r/g/b_w` | Optional diagnostic hex display (toggled by S2 button) |
 | 6 | `hdmi` | `debug_r/g/b_w` | TMDS | HDMI/DVI encoder → LVDS output buffers → connector |
 
-**Why Videx must be at position 3** (after VGC, before SuperSprite):
+**Ordering constraints**:
 
-- **After apple_video + VGC**: When Videx is active, it replaces the entire Apple II display (40-column text, graphics modes) with 80-column text. Videx must receive VGC output (not raw apple_video) because VGC may apply IIgs super hi-res rendering that should be the base when Videx is inactive. When Videx IS active, it replaces whatever VGC produced.
-- **Before SuperSprite**: The SuperSprite VDP provides a sprite/tile overlay that composites on top of the underlying video — whether that's Apple II native or Videx 80-column. A program could theoretically use both Videx text and SuperSprite sprites simultaneously. If Videx were after SuperSprite, it would obliterate the sprite layer.
+- **After `apple_video`**: Both VGC and Videx replace base Apple II video when active, so they must receive it (or a processed version of it) as input.
+- **VGC ↔ Videx order is arbitrary**: The Videx VideoTerm is an Apple ][/][+ card (1980); VGC super hi-res is an Apple IIgs feature. They are mutually exclusive by era — on any realistic system only one is ever active, so the other passes through unchanged. The current VGC → Videx ordering is a convention, not a technical requirement.
+- **Before SuperSprite**: The SuperSprite VDP provides a sprite/tile overlay that composites on top of the underlying video — whether that's Apple II native or Videx 80-column. A program could theoretically use both Videx text and SuperSprite sprites simultaneously. If Videx (or VGC) were after SuperSprite, it would obliterate the sprite layer.
 - **Before DebugOverlay**: The debug overlay must be last (before HDMI) so it's always visible regardless of which video modes are active.
 
 **Generate block passthrough**: When `VIDEX_CARD_ENABLE = 0`, the generate block's `else` clause provides combinational passthrough — the Videx output wires are directly assigned from the VGC output, adding zero logic and zero latency:
