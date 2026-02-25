@@ -522,7 +522,7 @@ vram_byte = {FLAGS.bit0, ascii_char[6:0]}
 
 The character ROM stores only 128 normal characters (2 KB). The ROM is addressed as `{vram_byte[6:0], scanline[3:0]}` (11-bit address into 2 KB ROM). Inverse characters (vram bit 7 = 1) are rendered by XOR-inverting the normal character's pixel data at capture time in the rendering pipeline, saving 1 BSRAM block.
 
-Only scanlines 0–8 are displayed (R9 = 8). Each character cell is 7 pixels wide. Scanlines 9–15 in the ROM are padding.
+Only scanlines 0–8 are displayed (R9 = 8). The charrom data is 8 bits wide; the current rendering pipeline uses only bits `[6:0]` (7 pixels per character). This drops bit 7, which is needed by box-drawing characters — see §27.1 for the gap analysis and fix plan. Scanlines 9–15 in the ROM are padding.
 
 ---
 
@@ -2892,3 +2892,129 @@ The `is_iie` runtime detection is implemented and verified in `apple_memory.sv`.
 ### 26.4 phi0 Qualification
 
 All address-sensitive signals in the card (`cfff_access`, `other_slot_rom`, C8S2 in SSC) must be phi0-qualified to prevent address bus transients during phi1 from causing spurious state changes. At 54+ MHz `clk_logic`, even single-cycle transients during address transitions (e.g., `$C33x` → `$C8xx` passing through `$CFFF`) can fire unqualified comparators.
+
+---
+
+## 27. Gap Analysis: Manual vs. Emulation
+
+Analysis of the Videx VideoTerm Installation & Operation Manual (4th Edition, November 1982, Curtis White / Darrell Aldrich, VT-MAN-000) against the FPGA emulation. The manual covers firmware 2.4 (the version in our ROM).
+
+### 27.1 Character Cell Width — 7 vs. 8 vs. 9 Pixels
+
+**Gap severity: Medium — visible rendering bug in box-drawing characters.**
+
+The real Videx hardware uses a **9-pixel-wide character cell**: 8 pixels from the character ROM + 1 extension pixel. The extension pixel is blank for normal text characters (inter-character spacing) or a copy of bit 0 (rightmost pixel) for line-drawing characters, creating seamless horizontal connections between adjacent cells.
+
+The emulation renders **7 pixels per character** (charrom bits `[6:0]`), dropping bit 7 entirely. This is incorrect — the character ROM is 8 bits wide and box-drawing/line-drawing characters (`$00–$1F`) use all 8 bits:
+
+| Charrom byte | Bit 7 | Characters using it |
+|---|---|---|
+| `$FF` | set | Block elements `$01–$07` (full horizontal bar scanlines) |
+| `$F0` | set | Box-drawing `$12, $13, $16, $17` (left horizontal segments, bits 7–4) |
+| `$1F` | clear | Box-drawing `$10, $11, $14, $15` (right horizontal segments, bits 4–0) |
+
+Dropping bit 7 means the left edge of horizontal lines in box-drawing characters is missing. Standard ASCII text is unaffected (the character data only uses bits `[6:0]` for text glyphs).
+
+**Fix — Level A (8 pixels, recommended):**
+
+Render `videxrom_d_r[7:0]` instead of `[6:0]`. Changes required in `videx_card.sv`:
+
+- `STEP_LENGTH`: 28 → 32 (4 chars × 8 pixels)
+- `PIX_BUFFER_SIZE`: 29 → 33
+- `WINDOW_WIDTH`: 560 → 640 (80 × 8), giving 40-pixel borders each side
+- `H_BORDER`: 80 → 40
+- `pix_buffer_r` capture ranges: `[7:0]`, `[15:8]`, `[23:16]`, `[31:24]` (was `[6:0]`, `[13:7]`, `[20:14]`, `[27:21]`)
+- XOR inverse/cursor mask: `{8{...}}` (was `{7{...}}`)
+- Recalculate `SCAN_PIX_OFFSET`, `STEP_LATCH_MEM`, and `HISTORY_PIXEL_OFFSET`
+
+BSRAM cost: **zero**. Shift register grows by 4 bits; negligible logic change.
+
+**Fix — Level B (9th pixel extension, optional enhancement on top of Level A):**
+
+Add a 9th pixel per character to replicate the real hardware's seamless line-drawing:
+
+- `STEP_LENGTH`: 32 → 36 (4 chars × 9 pixels)
+- `PIX_BUFFER_SIZE`: 33 → 37
+- `WINDOW_WIDTH`: 640 → 720 (fills the entire HDMI frame, zero horizontal border)
+- After capturing each char's 8 pixels, append bit 0 (rightmost pixel) for graphics characters or `0` for text characters
+- Detection heuristic: characters `$00–$1F` in the character ROM are line-drawing/block elements that need extension; standard ASCII characters (`$20–$7F`) do not
+
+BSRAM cost: **zero**. Wider shift register (37 vs 33 bits) plus a small amount of combinational logic.
+
+Trade-off: Level A fixes the rendering bug. Level B is a visual refinement for seamless box-drawing that also fills the frame edge-to-edge (matching real CRT behavior but potentially looking different on HDMI monitors).
+
+### 27.2 Alternate Character Set EPROM (U-17)
+
+**Gap severity: Low — only affects users who need non-ASCII character sets.**
+
+The real Videx card has two EPROM sockets:
+- **U-20**: Standard ASCII character set (always present)
+- **U-17**: Optional alternate character set (Katakana, Line Drawing, Symbol, Super/Subscript, etc.)
+
+Selection is controlled by the X7 solder point on the PCB:
+- X7 = normal: No inverse or alternate capability
+- X7 = inverse: VRAM bit 7 controls per-character inverse (current emulation behavior)
+- X7 = alternate: VRAM bit 7 selects U-17 vs U-20
+
+The firmware's `CTRL-Z 3` (set FLAGS bit 0) and `CTRL-Z 2` (clear FLAGS bit 0) commands switch between character sets. The `ENCODE_CHAR` routine injects FLAGS bit 0 into VRAM bit 7 via the `ASL/LSR/ROR` encoding (§9).
+
+The emulation implements only the **X7 = inverse** configuration: one 2 KB charrom (128 chars), with VRAM bit 7 controlling per-character pixel inversion via XOR at capture time. There is no second character ROM and no mechanism to switch between standard and alternate character sets.
+
+**Impact**: Software sending `CTRL-Z 3` expecting Katakana or Line Drawing characters gets inverse standard ASCII instead. This is correct for the most common X7=inverse configuration. Most physical Videx cards shipped with an empty U-17 socket (no alternate EPROM installed).
+
+**Fix (if ever needed)**:
+- Add a second 2 KB charrom file + pROM instance: **+1 BSRAM block** (45/46 total, 1 free)
+- Add a `VIDEX_ALTERNATE_CHARSET` parameter to select X7 mode (inverse vs alternate)
+- In alternate mode: use VRAM bit 7 to mux between charrom arrays instead of XOR inversion
+- Source an alternate EPROM binary (specific character set TBD)
+
+**Current decision**: Not implemented. The BSRAM cost (+1 block), need to source alternate charrom data, and mutual exclusivity with per-character inverse make this low priority without specific demand.
+
+### 27.3 Features Correctly Implemented
+
+All critical hardware behaviors documented in the manual are correctly emulated:
+
+| Manual Feature | Implementation |
+|---|---|
+| CRTC R0–R15 register file (HD6845SP Type 1 read-back) | All 16 registers stored and readable; R16+ returns `$00` |
+| Device select I/O (`$C0Bx`): bit 0 = register/data, bits 2–3 = bank | `crtc_idx`/`crtc_regs` write protocol; `bank_sel <= addr[3:2]` on every access |
+| VRAM banking (4 × 512 bytes at `$CC00–$CDFF`) | GoWin SDPB, `{bank_sel, addr[8:0]}` = 11-bit address |
+| Expansion ROM at `$C800–$CBFF` | 1 KB ROM array with slot ROM aliasing `$C300 = $CB00` |
+| `$CE00–$CFFF` returns open bus | Card does not assert `rd_en_o` for this range |
+| AN0-based 40/80 column switching | `videx_active = card_enable && text_mode_r && an0_r` |
+| Cursor blink modes (all 4 from R10 bits [6:5]) | Frame counter with 1/16 and 1/32 field rate |
+| Cursor scanline range (R10[3:0] start, R11[3:0] end) | Per-byte cursor matching within 4-char VRAM word |
+| Hardware scrolling via R12/R13 display start address | 11-bit base with modulo-2048 circular buffer wrap |
+| Per-character inverse (VRAM bit 7 XOR at pixel capture) | `pix_buffer <= charrom ^ {N{vram[7] ^ cursor}}` |
+| Character ROM halving (128 chars, inverse by XOR) | 2 KB pROM, saves 1 BSRAM vs. full 4 KB |
+| Firmware ROM (1 KB, verbatim ROM 2.4) | SHA-256 verified against physical hardware |
+| `$CFFF` deselect strobe clears C8 ownership | phi0-qualified `cfff_access` |
+
+### 27.4 Don't-Cares (Physical Hardware / Firmware State)
+
+Features documented in the manual that do not apply to the FPGA emulation:
+
+| Manual Feature | Why Not Applicable |
+|---|---|
+| CRT timing registers R0–R8 | FPGA outputs fixed 720×480 HDMI; R0–R8 stored for read-back only |
+| R8 interlace modes | HDMI is inherently progressive scan |
+| R16–R17 light pen registers | No software uses Videx light pen; reads return `$00` |
+| 17.430 MHz crystal / on-board clock circuit | FPGA uses PLL-derived `clk_pixel` (27 MHz) / `clk_logic` (54 MHz) |
+| `$C0Bx` bit 1 (8/9 cell matrix width select) | Firmware always uses 9-cell mode; bit is ignored, no software changes it |
+| Soft Video Switch physical PCB (F-14 socket) | FPGA uses digital pixel mux; AN0 logic replaces this |
+| Color killer signal (composite video) | `TEXT_MODE` flag is functionally equivalent |
+| Shift Wire Mod (keyboard encoder wire to PB3) | Apple II motherboard modification; firmware reads `$C063` via standard bus |
+| Display blanking during CPU VRAM writes | Dual-port SDPB eliminates bus contention; FPGA is superior |
+| Physical SRAM refresh / bus arbitration (U-14/U-15/U-16) | Dual-port memory eliminates time-multiplexed access |
+| 74LS166 shift register (U-21) | FPGA uses internal shift register in rendering pipeline |
+| 18-line display mode (7×12 character matrix) | Explicitly removed in firmware 2.4 errata |
+| Video set-up flags at `$07FB` | Pure firmware state in Apple II screen-hole RAM; hardware does not intercept |
+| EPROM socket types (2708/2716/2758) and solder points X3/X4 | Physical ROM chip configuration |
+| Firmware control code handlers (CTRL-A/G/H/J/K/L/M/S/U/Y/Z, ESC sequences) | All handled by verbatim ROM code executing on the 6502 |
+| Slot independence (pre-firmware 2.4) | Firmware 2.4 requires slot 3 only; emulation matches |
+
+### 27.5 Rendering Accuracy vs. Real Hardware
+
+The most significant architectural difference is that the real Videx generates its **own independent video signal** from a 17.430 MHz crystal, with CRTC registers R0–R9 genuinely controlling CRT scan timing. The FPGA rendering pipeline is synchronized to fixed HDMI output timing (720×480p), making R0–R9 purely stored state for read-back compatibility. This is a fundamental and correct design choice — all known software interacts with the Videx through VRAM writes and CRTC R10–R15, not through timing registers.
+
+The dual-port SDPB memory is also a strict improvement: the real hardware must blank the display during CPU VRAM writes (bus contention between CPU and CRTC), while the FPGA's separate read/write ports eliminate this artifact entirely.
