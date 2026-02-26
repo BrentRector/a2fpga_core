@@ -522,7 +522,7 @@ vram_byte = {FLAGS.bit0, ascii_char[6:0]}
 
 The character ROM stores only 128 normal characters (2 KB). The ROM is addressed as `{vram_byte[6:0], scanline[3:0]}` (11-bit address into 2 KB ROM). Inverse characters (vram bit 7 = 1) are rendered by XOR-inverting the normal character's pixel data at capture time in the rendering pipeline, saving 1 BSRAM block.
 
-Only scanlines 0–8 are displayed (R9 = 8). The charrom data is 8 bits wide; the current rendering pipeline uses only bits `[6:0]` (7 pixels per character). This drops bit 7, which is needed by box-drawing characters — see §27.1 for the gap analysis and fix plan. Scanlines 9–15 in the ROM are padding.
+Only scanlines 0–8 are displayed (R9 = 8). Each character cell is 8 pixels wide (all 8 bits of charrom data: `videxrom_d_r[7:0]`). Scanlines 9–15 in the ROM are padding.
 
 ---
 
@@ -812,15 +812,15 @@ When `videx_active` is false, the video output ports pass through the input Appl
 
 ### 13.2 Display Geometry
 
-- 80 columns × 24 rows × 9 scanlines = 560 × 216 active pixels
-- Doubled to 560 × 432 for HDMI output within 720 × 480 frame
-- V border = 24 pixels each side (vs. 48 for standard Apple II text)
+- 80 columns × 24 rows × 9 scanlines = 640 × 216 active pixels (8 pixels per character)
+- Doubled to 640 × 432 for HDMI output within 720 × 480 frame
+- H border = 40 pixels each side, V border = 24 pixels each side
 
 The Videx content window (432 lines) is taller than the Apple text window (384 lines). In the extended border areas (lines 24–47 and 432–455), Apple video outputs border color but Videx renders text content. The video mux replaces these pixels when Videx is active.
 
 ### 13.3 Scan Window and Pipeline Offset
 
-The rendering pipeline runs ahead of the display output by `SCAN_PIX_OFFSET = 32` pixels. This gives the pipeline time to fetch VRAM data and render characters before pixels are needed:
+The rendering pipeline runs ahead of the display output by `SCAN_PIX_OFFSET = 36` pixels. This gives the pipeline time to fetch VRAM data and render characters before pixels are needed:
 
 ```systemverilog
 wire scan_x_active_w = (screen_x_i > (H_LEFT_BORDER - SCAN_PIX_OFFSET))
@@ -831,9 +831,9 @@ wire scan_start_w  = (screen_x_i == (H_LEFT_BORDER - SCAN_PIX_OFFSET)) & y_activ
 
 `scan_start_w` resets the pipeline counters (`pix_step_r` and `h_offset_r`) at the beginning of each scanline.
 
-### 13.4 28-Step Pixel Cycle
+### 13.4 32-Step Pixel Cycle
 
-The pipeline processes 4 characters (28 pixels + 1 gap pixel = 29 total in the buffer) per cycle. A 5-bit step counter (`pix_step_r`) counts 0–27, resetting on `scan_start_w`.
+The pipeline processes 4 characters (32 pixels + 1 gap pixel = 33 total in the buffer) per cycle. A 5-bit step counter (`pix_step_r`) counts 0–31, resetting on `scan_start_w`.
 
 Key pipeline stages:
 
@@ -841,14 +841,14 @@ Key pipeline stages:
 |------|--------|
 | 0 (`STEP_LOAD_MEM`) | Issue VRAM read: set `scanner_vram_addr` and `scanner_vram_rd` |
 | 1–13 | SDPB pipeline + hold register capture (clk_logic domain, see §13.5) |
-| 14 (`STEP_LATCH_MEM`) | Latch `scanner_hold` into `videx_data_r`; clear gap pixel `pix_buffer_r[28]` |
+| 14 (`STEP_LATCH_MEM`) | Latch `scanner_hold` into `videx_data_r`; clear gap pixel `pix_buffer_r[32]` |
 | 15 | Issue charrom lookup for char 0 (`videx_data_r[6:0]`) |
 | 16 | Issue charrom lookup for char 1 (`videx_data_r[14:8]`) |
-| 17 | Capture char 0 pixels with inverse/cursor XOR; issue charrom lookup for char 2 |
+| 17 | Capture char 0 pixels (`videxrom_d_r[7:0]`) with inverse/cursor XOR; issue charrom lookup for char 2 |
 | 18 | Capture char 1 pixels with inverse/cursor XOR; issue charrom lookup for char 3 |
 | 19 | Capture char 2 pixels with inverse/cursor XOR |
 | 20 | Capture char 3 pixels with inverse/cursor XOR |
-| 27 (`STEP_LAST`) | Load shift register from pixel buffer; advance `h_offset_r += 2` |
+| 31 (`STEP_LAST`) | Load shift register from pixel buffer; advance `h_offset_r += 2` |
 
 The column counter `h_offset_r` (6 bits) advances by 2 each cycle. The VRAM byte address is computed as `{4'b0, h_offset_r, 1'b0}` (effectively `h_offset * 2`), so consecutive cycles read consecutive 4-byte VRAM words. Over 20 cycles: 80 columns.
 
@@ -864,7 +864,7 @@ The VRAM read path:
 5. `scanner_hold` capture (1 clk_logic cycle)
 6. Total: ~6 clk_logic cycles worst case
 
-The `scanner_hold` register is written on `clk_logic` and read on `clk_pixel` at step 14 (= 28 clk_logic cycles after step 0). With a 6-cycle path, there are 22 clk_logic cycles of margin.
+The `scanner_hold` register is written on `clk_logic` and read on `clk_pixel` at step 14 (= 28 clk_logic cycles after step 0). With a 6-cycle path, there are 22 clk_logic cycles of margin. (STEP_LATCH_MEM is unchanged at 14 despite the 32-step cycle — the extra steps provide even more margin.)
 
 ### 13.6 VRAM Address for Rendering
 
@@ -888,7 +888,7 @@ The 2 KB half-size character ROM (`videx_charrom.hex`) is instantiated inside `v
 
 ```
 rom_addr = {vram_byte[6:0], scanline[3:0]}   // 11-bit address into 2 KB ROM
-pixel_data = videxrom[rom_addr]               // 8 bits, only lower 7 used
+pixel_data = videxrom[rom_addr]               // 8 bits, all used
 ```
 
 The ROM stores only normal characters (0x00–0x7F). Inverse characters use the same ROM data with pixel inversion applied at capture (§13.8).
@@ -907,7 +907,7 @@ cursor_byte     = (cursor_addr - char_addr)[1:0]
 
 Rendered by XOR combining the character's inverse flag (vram bit 7) with per-byte cursor matching:
 ```
-pix_buffer[6:0] = rom_data[6:0] ^ {7{vram_byte[7] ^ (cursor_active && cursor_byte == N)}}
+pix_buffer[7:0] = rom_data[7:0] ^ {8{vram_byte[7] ^ (cursor_active && cursor_byte == N)}}
 ```
 Where `N` is 0, 1, 2, or 3 for each of the 4 characters in the group.
 
@@ -915,7 +915,7 @@ This means: normal char + no cursor = normal pixels, inverse char + no cursor = 
 
 ### 13.9 Pixel Output and History Delay
 
-The 29-bit pixel buffer is loaded into a shift register (`pix_shift_r`) at `STEP_LAST`. The shift register outputs one pixel per `clk_pixel` cycle via `pix_out_w = pix_shift_r[0]`.
+The 33-bit pixel buffer is loaded into a shift register (`pix_shift_r`) at `STEP_LAST`. The shift register outputs one pixel per `clk_pixel` cycle via `pix_out_w = pix_shift_r[0]`.
 
 A pixel history shift register (`pix_history_r`, 8 bits) provides pipeline alignment delay. The color logic reads from `pix_history_r[HISTORY_PIXEL_OFFSET]` (offset 4) to align Videx pixel timing with the display output.
 
@@ -929,7 +929,7 @@ assign videx_g_o = videx_pixel_active ? {pix_g, 4'h0} : apple_vga_g_i;
 assign videx_b_o = videx_pixel_active ? {pix_b, 4'h0} : apple_vga_b_i;
 ```
 
-`videx_pixel_active` is true when `videx_active` (mode is on) AND the current pixel is within the Videx content window (560 × 432). The 4-bit palette color (`pix_r/g/b`) is expanded to 8-bit RGB by zero-filling the low nibble.
+`videx_pixel_active` is true when `videx_active` (mode is on) AND the current pixel is within the Videx content window (640 × 432). The 4-bit palette color (`pix_r/g/b`) is expanded to 8-bit RGB by zero-filling the low nibble.
 
 ### 13.11 Color Generation
 
@@ -2901,11 +2901,11 @@ Analysis of the Videx VideoTerm Installation & Operation Manual (4th Edition, No
 
 ### 27.1 Character Cell Width — 7 vs. 8 vs. 9 Pixels
 
-**Gap severity: Medium — visible rendering bug in box-drawing characters.**
+**Status: Level A fixed.** The rendering pipeline now uses all 8 bits of charrom data (`videxrom_d_r[7:0]`), producing 640 × 432 active pixels (80 chars × 8 pixels, 40-pixel horizontal borders). Box-drawing characters render correctly.
 
-The real Videx hardware uses a **9-pixel-wide character cell**: 8 pixels from the character ROM + 1 extension pixel. The extension pixel is blank for normal text characters (inter-character spacing) or a copy of bit 0 (rightmost pixel) for line-drawing characters, creating seamless horizontal connections between adjacent cells.
+**Remaining gap (Level B — 9th pixel extension):** The real Videx hardware uses a **9-pixel-wide character cell**: 8 pixels from the character ROM + 1 extension pixel. The extension pixel is blank for normal text characters (inter-character spacing) or a copy of bit 0 (rightmost pixel) for line-drawing characters, creating seamless horizontal connections between adjacent cells. This 9th pixel is not implemented. Horizontal line segments in box-drawing characters may show a 1-pixel gap between adjacent cells.
 
-The emulation renders **7 pixels per character** (charrom bits `[6:0]`), dropping bit 7 entirely. This is incorrect — the character ROM is 8 bits wide and box-drawing/line-drawing characters (`$00–$1F`) use all 8 bits:
+The charrom data uses all 8 bits. Box-drawing/line-drawing characters (`$00–$1F`) use bit 7 for left-edge horizontal lines:
 
 | Charrom byte | Bit 7 | Characters using it |
 |---|---|---|
@@ -2915,21 +2915,9 @@ The emulation renders **7 pixels per character** (charrom bits `[6:0]`), droppin
 
 Dropping bit 7 means the left edge of horizontal lines in box-drawing characters is missing. Standard ASCII text is unaffected (the character data only uses bits `[6:0]` for text glyphs).
 
-**Fix — Level A (8 pixels, recommended):**
+**Level A fix applied**: `WINDOW_WIDTH` 560→640, `STEP_LENGTH` 28→32, `PIX_BUFFER_SIZE` 29→33, `SCAN_PIX_OFFSET` 32→36. Pixel captures use `videxrom_d_r[7:0]` with `{8{...}}` XOR mask, buffer ranges `[7:0]`/`[15:8]`/`[23:16]`/`[31:24]`. BSRAM cost: zero.
 
-Render `videxrom_d_r[7:0]` instead of `[6:0]`. Changes required in `videx_card.sv`:
-
-- `STEP_LENGTH`: 28 → 32 (4 chars × 8 pixels)
-- `PIX_BUFFER_SIZE`: 29 → 33
-- `WINDOW_WIDTH`: 560 → 640 (80 × 8), giving 40-pixel borders each side
-- `H_BORDER`: 80 → 40
-- `pix_buffer_r` capture ranges: `[7:0]`, `[15:8]`, `[23:16]`, `[31:24]` (was `[6:0]`, `[13:7]`, `[20:14]`, `[27:21]`)
-- XOR inverse/cursor mask: `{8{...}}` (was `{7{...}}`)
-- Recalculate `SCAN_PIX_OFFSET`, `STEP_LATCH_MEM`, and `HISTORY_PIXEL_OFFSET`
-
-BSRAM cost: **zero**. Shift register grows by 4 bits; negligible logic change.
-
-**Fix — Level B (9th pixel extension, optional enhancement on top of Level A):**
+**Remaining — Level B (9th pixel extension, optional):**
 
 Add a 9th pixel per character to replicate the real hardware's seamless line-drawing:
 
