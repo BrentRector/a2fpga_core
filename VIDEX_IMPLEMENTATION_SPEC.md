@@ -186,6 +186,27 @@ These are programmed by the firmware at ROM offset `$0A1` (CPU `$C8A1`), not by 
 | R14 | `$00`        | Cursor Address High |
 | R15 | `$00`        | Cursor Address Low |
 
+#### 4.4.0 Character Cell Size — Manual vs. Firmware
+
+The Videx VideoTerm Installation & Operation Manual (page 3-3, "VIDEOTERM Initialization") states:
+
+> *"each character defined as a 7 by 9 matrix within a total 8 by 10 matrix cell, allowing for a slight border around the character."*
+
+The "8 by 10" claim is **incorrect**. The MC6845 R9 register ("Maximum Scan Line Address") defines the highest row counter value within a character row. R9 = `$08` means the counter cycles 0→1→2→…→8 then resets — **9 scanlines per row**, not 10. Three independent lines of evidence confirm this:
+
+1. **Firmware**: The CRTC init table at `$C8A1` writes R9 = `$08` (9 scanlines). For "8 by 10" to be correct, R9 would need to be `$09`.
+
+2. **CRT timing math**: The 50 Hz variant produces 35 rows × 9 scanlines + 0 adjust = 315 total lines → 49.98 Hz. With 10 scanlines/row, it would be 350 lines → 44.99 Hz — far outside PAL tolerance. The 60 Hz variant similarly requires 9 scanlines/row to produce a valid 60.08 Hz refresh.
+
+3. **Manual self-contradiction**: The overview section (page 13 of the PDF) states "7 by 9 character dot matrix size (the full matrix is actually 9 by 9)" — consistent with R9 = `$08`.
+
+The character cell is correctly described as:
+- **7 × 9 glyph**: 7 of 8 ROM pixels wide, 9 scanlines tall (matching the manual's "7 by 9 matrix")
+- **9 × 9 cell**: 8 ROM pixels + 1 hardware-generated blank column (74LS166 9th clock cycle), 9 scanlines tall
+- **Not 8 × 10**: The manual's initialization section appears to contain a documentation error
+
+The A2FPGA implementation uses 8 × 9 (8 ROM pixels wide, 9 scanlines tall), which matches the firmware and hardware behavior. The 9th pixel column (inter-character gap) is provided implicitly by the HDMI pixel grid spacing.
+
 #### 4.4.1 50 Hz vs. 60 Hz CRTC Variants
 
 The Videx VideoTerm ROM 2.4 exists in two known variants that differ only in CRT timing registers. MAME catalogs both:
