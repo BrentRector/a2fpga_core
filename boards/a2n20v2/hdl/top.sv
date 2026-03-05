@@ -39,6 +39,9 @@ module top #(
     parameter bit VIDEX_CARD_ENABLE = 1,
     parameter bit [7:0] VIDEX_CARD_ID = 5,
 
+    parameter bit THUNDERCLOCK_ENABLE = 1,
+    parameter bit [7:0] THUNDERCLOCK_ID = 6,
+
     parameter bit CLEAR_APPLE_VIDEO_RAM = 1,    // Clear video ram on startup
     parameter bit HDMI_SLEEP_ENABLE = 1,        // Sleep HDMI output on CPU stop
     parameter bit IRQ_OUT_ENABLE = 1,           // Allow driving IRQ to Apple bus
@@ -507,19 +510,42 @@ module top #(
         assign videx_vga_b_w = vgc_vga_b;
     end endgenerate
 
+    // ThunderClock Plus
+
+    wire [7:0] tc_d_w;
+    wire tc_rd;
+    wire tc_irq_n;
+    wire tc_rom_en;
+
+    thunderclock_card #(
+        .CLOCK_SPEED_HZ(CLOCK_SPEED_HZ),
+        .ENABLE(THUNDERCLOCK_ENABLE),
+        .ID(THUNDERCLOCK_ID)
+    ) thunderclock (
+        .a2bus_if(a2bus_if),
+        .a2mem_if(a2mem_if),
+        .slot_if(slot_if),
+
+        .data_o(tc_d_w),
+        .rd_en_o(tc_rd),
+        .irq_n_o(tc_irq_n),
+        .rom_en_o(tc_rom_en)
+    );
+
     // Data output
 
-    assign data_out_en_w = ssp_rd || mb_rd || ssc_rd || videx_rd;
+    assign data_out_en_w = ssp_rd || mb_rd || tc_rd || ssc_rd || videx_rd;
 
     assign data_out_w = videx_rd ? videx_d_w :
         ssc_rd ? ssc_d_w :
+        tc_rd ? tc_d_w :
         ssp_rd ? ssp_d_w :
         mb_rd ? mb_d_w :
         a2bus_if.data;
 
     // Interrupts
 
-    assign irq_n_w = mb_irq_n && vdp_irq_n && ssc_irq_n;
+    assign irq_n_w = mb_irq_n && vdp_irq_n && ssc_irq_n && tc_irq_n;
 
     // Audio
 

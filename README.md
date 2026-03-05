@@ -1,10 +1,11 @@
-# A2FPGA Multicard Core — Videx VideoTerm Edition
+# A2FPGA Multicard Core — Videx & ThunderClock Edition
 
 This is a fork of the [A2FPGA Multicard Core](https://github.com/a2fpga/a2fpga_core) that adds
-**Videx VideoTerm 80-column card emulation** along with bus timing bug fixes and HDMI
-compatibility improvements. See the [upstream repository](https://github.com/a2fpga/a2fpga_core)
-for full documentation on the A2FPGA hardware, board variants, and base card emulation
-(Mockingboard, SuperSprite, Super Serial Card).
+**Videx VideoTerm 80-column card emulation** and **ThunderClock Plus clock card emulation**,
+along with bus timing bug fixes and HDMI compatibility improvements. See the
+[upstream repository](https://github.com/a2fpga/a2fpga_core) for full documentation on the
+A2FPGA hardware, board variants, and base card emulation (Mockingboard, SuperSprite, Super
+Serial Card).
 
 ## What This Fork Adds
 
@@ -27,6 +28,11 @@ This fork provides a complete VideoTerm emulation including:
   GoWin SDPB block with asymmetric port widths
 - **Character ROM** — captured from a physical Videx VideoTerm adapter, with character
   ROM halving (chars $80-$FF are the inverse of $00-$7F) to save BSRAM
+- **80-column rendering pipeline** — character ROM lookup, cursor blink, inverse video,
+  line doubling, and color palette support (Apple II and IIgs palettes) rendered at
+  640x432 within the 720x480 VGA frame
+- **40/80-column switching** — controlled by AN0 ($C058/$C059), matching real Videx
+  hardware; Ctrl-Reset restores 40-column mode
 
 The Videx card is emulated in **slot 3** (required by the Apple II's SLOTC3ROM/INTC8ROM
 hardware architecture). The A2FPGA card can be physically installed in any slot — all
@@ -36,11 +42,77 @@ emulated cards operate independently of the physical slot position.
 - Apple Pascal 1.3 — boots to 80-column mode, full console I/O working
 - Original Videx VideoTerm Demo application
 - Custom VIDEX_DIAG test suite (passes all register, ROM, and VRAM tests)
-- Concurrent operation with SSC, Mockingboard, and SuperSprite emulation
+- Concurrent operation with SSC, Mockingboard, SuperSprite, and ThunderClock emulation
 
 See [VIDEX_IMPLEMENTATION_SPEC.md](VIDEX_IMPLEMENTATION_SPEC.md) for complete technical
 documentation including MC6845 register map, bus protocol details, rendering pipeline
 architecture, and annotated firmware disassembly.
+
+### ThunderClock Plus Clock Card Emulation
+
+The [ThunderClock Plus](https://en.wikipedia.org/wiki/Thunderware) by Thunderware was the
+de facto standard clock card for the Apple II family. It is the only clock card with a
+built-in ProDOS clock driver — ProDOS automatically detects and uses it without any
+additional software installation, providing date and time stamps for all file operations.
+
+The ThunderClock Plus uses a NEC uPD1990AC serial I/O calendar clock chip to maintain
+the current date and time, communicating with the Apple II through a 6-bit control
+register and 1-bit serial data output at a single device-select address.
+
+This fork provides a complete ThunderClock Plus emulation including:
+
+- **NEC uPD1990AC clock chip** — full emulation of the serial calendar clock with 40-bit
+  BCD time register (seconds, minutes, hours, day-of-month, day-of-week, month), all 7
+  command modes (register hold, shift, time set, time read, and 4 timer pulse rates),
+  edge-triggered serial shift clock and strobe, and 1 Hz timekeeping derived from the
+  FPGA's 54 MHz logic clock
+- **2 KB firmware ROM** — the original ThunderClock Plus firmware with built-in ProDOS
+  clock driver, serving slot ROM ($C1xx) and expansion ROM ($C800-$CFFF). Contains the
+  ProDOS auto-detection signature bytes ($08, $28, $58, $70 at offsets 0, 2, 4, 6) that
+  enable automatic clock discovery during ProDOS boot
+- **Device-select register** — single I/O address ($C090 for slot 1) providing write
+  access to the uPD1990AC control signals (data-in, shift clock, strobe, and 3-bit
+  command code) and read access to serial data output and IRQ status
+- **IRQ support** — active-low interrupt output driven by the uPD1990AC timer pulse,
+  supporting interrupt-driven time-of-day updates at selectable rates (64, 256, 2048,
+  or 4096 Hz)
+- **Time persistence across resets** — the emulated uPD1990AC uses the FPGA's
+  device-only reset (power-on reset) rather than the Apple II system reset, so the
+  clock retains its time across Apple II soft resets (e.g., PR#6, Ctrl-Reset) just like
+  the real battery-backed chip. If the FPGA remains powered (e.g., via USB-C from an
+  always-on Raspberry Pi), the clock also survives Apple II power cycles
+- **C8-space ownership** — phi0-qualified expansion ROM ownership with dynamic slot
+  detection (learns its slot number at runtime from slotmaker) and self-clearing on
+  $CFFF access or other-slot ROM access
+
+**How time works:** The emulated ThunderClock functions like a "ThunderClock Plus with
+no batteries." On FPGA power-up, the clock initializes to midnight, January 1 (Sunday).
+Use the ThunderClock utilities (e.g., Thunderware's `TIME` program) or any compatible
+clock-setting software to set the current date and time. The clock then keeps time
+accurately using the FPGA's crystal oscillator.
+
+**USB-C power persistence:** The A2FPGA's Tang Nano 20K has a USB-C connector that can
+receive power independently from the Apple II's slot power. If you connect a USB-C cable
+from an always-on device — such as a Raspberry Pi, USB power adapter, or USB power bank
+— to the A2FPGA's USB-C connector, the FPGA remains powered even when the Apple II is
+turned off. This keeps the emulated ThunderClock's internal time counter running
+continuously, providing battery-like time persistence across Apple II power-off/power-on
+cycles without any batteries. You only need to set the time once after connecting
+USB-C power; subsequent Apple II reboots and power cycles will retain the correct time.
+Disconnecting the USB-C cable while the Apple II is also powered off will cause the
+emulated clock to lose its time setting.
+
+**ProDOS integration:** ProDOS scans slots 7 through 1 during boot, looking for the
+ThunderClock signature bytes. When found, ProDOS installs the firmware's built-in clock
+driver, which is called automatically for every file create, write, and directory
+operation. No additional clock driver software or configuration is needed — just boot
+ProDOS and file timestamps work.
+
+**Tested with:**
+- ProDOS 2.4.3 — automatic clock detection and file timestamping
+- Thunderware ThunderClock utility disk — `TIME` program for setting date/time,
+  `CLOCK` program for continuous time display
+- Concurrent operation with Videx, SSC, Mockingboard, and SuperSprite emulation
 
 ### Bug Fixes (Submitted Upstream)
 
@@ -83,7 +155,8 @@ settings.
 
 ### Updating the Bitstream
 
-To flash this fork's bitstream (with Videx emulation enabled) to an A2N20v2 card:
+To flash this fork's bitstream (with Videx and ThunderClock emulation enabled) to an
+A2N20v2 card:
 
 **Mac/Linux (OpenFPGALoader):**
 
@@ -107,21 +180,36 @@ This build emulates the following cards, all from a single physical A2FPGA card:
 
 | Emulated Slot | Card | Notes |
 |:---:|--------|-------|
+| 1 | **ThunderClock Plus** | ProDOS auto-detect clock card (any slot works) |
 | 2 | Super Serial Card | USB serial for ADTPro (conventional slot for serial/modem) |
 | 3 | **Videx VideoTerm** | 80-column display (hardware requirement — must be slot 3) |
 | 4 | Mockingboard | Stereo AY-3-8910 sound (conventional slot — most software assumes slot 4) |
 | 7 | SuperSprite | TMS9918a sprite graphics (conventional slot 7 default) |
 
-Videx must remain in slot 3 (Apple II hardware requirement). SSC, Mockingboard, and
-SuperSprite use their conventional slot assignments (2, 4, and 7 respectively) which most
-software expects. These can be reassigned if needed. Slot assignments are configured in
-[hdl/slots/slots.hex](hdl/slots/slots.hex).
+Videx must remain in slot 3 (Apple II hardware requirement). The ThunderClock can be
+assigned to any slot — ProDOS scans all slots 7 through 1 during boot. SSC, Mockingboard,
+and SuperSprite use their conventional slot assignments (2, 4, and 7 respectively) which
+most software expects. All assignments can be reassigned if needed. Slot assignments are
+configured in [hdl/slots/slots.hex](hdl/slots/slots.hex).
 
 The physical A2FPGA card can be installed in any slot. With Videx emulation enabled,
 **slot 3 is recommended** — since the Videx emulation claims slot 3's address space, no
 other physical card can use that slot, so you may as well use it for the A2FPGA itself.
 (The upstream project recommends slot 7 for builds without Videx.) Ensure the emulated
 slot numbers do not conflict with physical cards in your system.
+
+### Resource Utilization (A2N20v2, GW2AR-18C)
+
+With all five emulated cards enabled (Videx, ThunderClock, SSC, Mockingboard, SuperSprite):
+
+| Resource | Used | Available | Utilization |
+|----------|-----:|----------:|:-----------:|
+| BSRAM    |   45 |        46 | 98% |
+| LUT      | 6753 |    20736  | 33% |
+| Register | 4433 |    15552  | 29% |
+
+The ThunderClock adds 1 BSRAM block (2 KB pROM for firmware ROM), ~250 LUTs, and ~160
+registers — the smallest resource cost of any emulated card.
 
 ## Building from Source
 
@@ -151,6 +239,12 @@ design, documentation, and extensive testing provided by
 Videx VideoTerm 80-column card emulation by [Brent Rector](https://github.com/BrentRector).
 Character ROM data captured from a physical Videx VideoTerm adapter.
 
+### ThunderClock Plus Emulation
+
+ThunderClock Plus clock card emulation by [Brent Rector](https://github.com/BrentRector).
+NEC uPD1990AC clock chip behavior referenced from the uPD1990AC datasheet, MAME's
+`thunderclock.cpp` / `upd1990a.cpp` implementations, and izapple2's `microPD1990ac.go`.
+
 ### Open Source Cores
 
 The A2FPGA Multicard Core draws from a number of open source FPGA cores:
@@ -179,7 +273,8 @@ original impetus for the A2FPGA project.
 
 ## License
 
-New Videx emulation code (`hdl/videx/`, `tools/gen_videx_rom.py`) is released under the
+New Videx and ThunderClock emulation code (`hdl/videx/`, `hdl/thunderclock/`,
+`tools/gen_videx_rom.py`) is released under the
 [MIT License](LICENSE) (Copyright 2026 Brent Rector).
 
 Upstream A2FPGA code retains its original per-file licenses (ISC, MIT, BSD-3, GPL v2+ — see
