@@ -12,7 +12,7 @@ We have three 1024-byte ROM dumps from real cards:
 
 After meticulous transcription from photographic dumps, cross-checked against valid 6502 disassembly and confirmed byte-by-byte, the diffs are precise: **FRM-602 differs from 2.4 in 13 bytes; FRM-600 differs from 2.4 in 17 bytes**. Every single one of those differences sits within a 13-byte stretch from `$C808` to `$C82D` (the SETUP routine) and a 16-byte stretch from `$C8A1` to `$C8B0` (the CRTC initialization table). Nothing else changes — every other byte of the firmware, all 994+ of them, is byte-identical across all three variants.
 
-That last point is worth restating: from a programmer's point of view, the three ROMs are functionally indistinguishable. The same Pascal entry vectors. The same ESC sequences. The same CR/LF/scroll/cursor behavior. The same Ctrl-S pause and Ctrl-C resume. The same GETLN cursor-unblink trick that breaks CP/M boot loaders. The Videoterm's *behavior* with respect to the Apple II is the same firmware in all three. What differs is purely *the picture it paints* — how the on-card CRTC drives a CRT monitor.
+That last point is worth restating: from a programmer's point of view, the three ROMs are functionally indistinguishable. The same Pascal entry vectors. The same ESC sequences. The same CR/LF/scroll/cursor behavior. The same Ctrl-S pause and Ctrl-C resume. The same GETLN-aware input handler at `$CB32` that writes through `(BASL),Y` to un-blink the cursor before polling the keyboard. The Videoterm's *behavior* with respect to the Apple II is the same firmware in all three. What differs is purely *the picture it paints* — how the on-card CRTC drives a CRT monitor.
 
 ## The two distinct changes
 

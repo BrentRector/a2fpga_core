@@ -778,11 +778,10 @@ STEXIT:
 ;   writing the underlying character (caller passes it in A) back
 ;   to the cursor position before polling for input. Apple BASIC's
 ;   GETLN sets MON_BASL/Y to point at the cursor cell each call.
-;   Callers that DON'T follow this convention (CP/M boot loaders,
-;   some assembler runtimes) will get a stray byte written to
-;   whatever (BASL),Y happens to point to -- which is a known
-;   source of obscure compatibility issues but cannot be removed
-;   without breaking BASIC's cursor un-blink behavior.
+;   Callers that don't follow this convention will receive an
+;   unwanted side-effect write to whatever (BASL),Y happens to
+;   point at, but the store cannot be removed without breaking
+;   BASIC's cursor un-blink behavior.
 ; 
 ;   Then SEC (input flag) ; CLV (force BVC at $CB4A) ; fall to ENTR.
 INENTR:
