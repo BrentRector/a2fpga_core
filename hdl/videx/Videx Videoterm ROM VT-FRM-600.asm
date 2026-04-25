@@ -41,13 +41,14 @@
 ;          600   NTSC:  htotal=124 chars * vtotal=260 scan = 60.07 Hz
 ;          602   PAL :  htotal=124 chars * vtotal=315 scan = 49.58 Hz
 ;
-;   Comparison vs the sister 50 Hz variant VT-FRM-602:
+;   Comparison vs the 50 Hz follow-on VT-FRM-602:
 ;     - SETUP loop reorganization: IDENTICAL.
 ;     - CRTC table: 600 changes 6 registers (R0,R2,R3,R4,R5,R7);
-;                   602 changes only 2 (R0,R7). Both share the same
-;                   R0 ($7B) and R7 ($1A) values, suggesting they
-;                   were derived from a common template with R2-R5
-;                   re-tuned for the NTSC scan rate.
+;                   602 changes only 2 (R0,R7). FRM-602 (c) 1983
+;                   appears to be derived from this 1982 FRM-600
+;                   codebase by reverting R2/R3/R4/R5 back to the
+;                   ROM 2.4 PAL values, while keeping the SETUP
+;                   refactor and the R0/R7 monitor tweaks.
 ;
 ;   Symbols, conventions, and slot-3 screen-hole assumptions match
 ;   the 2.4 disassembly. Identical instruction streams reproduced

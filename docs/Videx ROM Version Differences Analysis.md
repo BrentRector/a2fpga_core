@@ -61,7 +61,7 @@ What the rewrite *does* change: the loop tail shrinks from 5 bytes (`E8 E0 10 D0
 
 Eleven bytes change in total: `$C808`, `$C81A`, and the 9-byte stretch `$C825-$C82D`. **All eleven are bit-for-bit identical between FRM-600 and FRM-602.**
 
-This shared reorganization is the strongest evidence that the two non-2.4 variants were forked from a *common* refactored intermediate base, not independently re-edited from 2.4. Someone at Videx took ROM 2.4, rewrote the SETUP loop in a more compact form, and that became the new template; *then* the template was retuned in two directions for two different markets.
+This shared reorganization is the strongest evidence that one of the newer ROMs was derived from the other rather than each being independently re-edited from 2.4. Combined with the copyright dates on the chips — FRM-600 © 1982, FRM-602 © 1983 — the natural reading is that FRM-600 came first as a thorough refresh of ROM 2.4 (refactored SETUP loop, retuned CRTC for NTSC, R0/R7 monitor tweaks), and a year later FRM-602 was derived from the FRM-600 codebase by reverting the NTSC-specific CRTC values back to their 2.4 PAL counterparts.
 
 ### Change #2: the CRTC initialization table
 
@@ -126,14 +126,13 @@ In other words: 100% of the code that interacts with the CPU is the same in all 
 
 ## Engineering interpretation
 
-Reading the pattern of shared and unshared bytes, the most likely development history is:
+Reading the pattern of shared and unshared bytes alongside the chip copyright dates, the most likely development history is:
 
-1. **Videx ships v2.4 first** (or in parallel as the original European version).
-2. **Some time later, an engineer refactors the SETUP loop** — perhaps as part of a code-cleanup pass, perhaps as part of a tooling change. The DEX/BPL form is one byte shorter, gets padded with a NOP for binary compatibility. The R0 and R7 init values are also tweaked to match a newer monitor that Videx is now shipping with or qualifying against. This produces a refactored 50-Hz template — let's call it the 600/602 base.
-3. **VT-FRM-602** is that base, untouched beyond R0/R7. It's the new European/PAL release.
-4. **VT-FRM-600** is the *same* refactored base with R2-R5 additionally retuned for 60 Hz scan timing and R3 narrowed for NTSC HSync width. It's the North American release.
+1. **ROM 2.4** is the original European/PAL release (no copyright date observed in this study; the "v2.4" version label and its un-refactored SETUP loop place it before the FRM-6xx family).
+2. **VT-FRM-600 ships in 1982** as a substantial refresh aimed at the North American market: the SETUP loop is rewritten in the more compact DEX/BPL form (saving one byte, padded with NOP for binary address compatibility), the CRTC table is retuned for NTSC 60 Hz timing (R2, R3, R4, R5), and two further CRTC tweaks (R0 +1 char of horizontal blanking, R7 firing VSync 3 rows earlier) are applied for monitor-friendliness on whatever new monitor Videx was qualifying against.
+3. **VT-FRM-602 ships in 1983** as the European counterpart of FRM-600. It takes the 1982 FRM-600 codebase and reverts the four NTSC-specific CRTC values (R2, R3, R4, R5) back to their ROM 2.4 PAL values, while keeping the SETUP refactor and the R0/R7 monitor tweaks. The result is essentially "FRM-600's improvements, but for European 50 Hz monitors."
 
-The naming hints at this lineage too: "FRM" presumably stands for "firmware," and the trailing 600/602 numbers are part-number suffixes that group the two together as a release pair — `-600` for 60 Hz, `-602` for 50 Hz, both part of the same family. ROM 2.4 sits outside that family, predating the SETUP refactor.
+The naming hints at this lineage too: "FRM" presumably stands for "firmware," with the trailing digits encoding the chip's intended scan rate — `-600` for 60 Hz, `-602` for the 50 Hz variant of the same revision family. ROM 2.4 sits outside the FRM-6xx family entirely, predating the SETUP refactor and the R0/R7 polish.
 
 ## Practical implications
 
@@ -142,7 +141,7 @@ The naming hints at this lineage too: "FRM" presumably stands for "firmware," an
 - **Mixing variants** is harmless from the Apple II side: a card with FRM-600 in one slot and FRM-602 in another would coexist without firmware conflicts. The picture quality would just differ between the two cards' outputs.
 - **For an FPGA replica**, only one of the three needs to be implemented for any given target market — but if you want a "monitor-region" toggle, you have a remarkably small surface area to switch: 13 bytes of SETUP code (or just the 2-6 CRTC init values) is all that varies. Everything else is one shared ROM image.
 
-The bottom line: three almost-identical 1 KB firmwares, fundamentally the same driver, differing only in how they tell the CRTC chip to paint the screen. ROM 2.4 is the original PAL release; FRM-602 is its monitor-tweaked PAL successor; FRM-600 is the NTSC sibling of FRM-602.
+The bottom line: three almost-identical 1 KB firmwares, fundamentally the same driver, differing only in how they tell the CRTC chip to paint the screen. ROM 2.4 is the original PAL release; FRM-600 (1982) is the next-generation NTSC firmware with refactored SETUP and monitor-friendliness tweaks; FRM-602 (1983) is FRM-600 backported to PAL by reverting just four CRTC timing values.
 
 ## Relevance to the A2FPGA implementation
 
