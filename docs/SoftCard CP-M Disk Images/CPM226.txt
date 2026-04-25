@@ -1,0 +1,10 @@
+Softcard //e CP/M
+64K  Version 2.26
+(c) 1983 Microsoft Corporation
+Softcard is a trademark of Microsoft Corporation
+CP/M is a registered trademark of Digital Research, Inc.
+
+BASIC-80 Rev. 5.27
+(Softcard //e CP/M Version)
+Copyright 1983 (C) by Microsoft
+Created: 12-Apr-83
