@@ -7,8 +7,8 @@ The Videx Videoterm is an 80-column display card for the Apple II family, introd
 We have three 1024-byte ROM dumps from real cards:
 
 - **`Videx Videoterm ROM 2.4.bin`** — the baseline disassembled version, labeled "v2.4 (50 Hz / European)" by the original disassembler. PAL frame rate.
-- **`Videx Videoterm ROM VT-FRM-600.bin`** — captured from a physical Videx Videoterm card with a ROM labeled VT-FRM-600 (c) 1982.
-- **`Videx Videoterm ROM VT-FRM-602.bin`** — captured from a physical Videx Videoterm card with a ROM labeled VT-FRM-602 (c) 1983.
+- **`Videx Videoterm ROM VT-FRM-600.bin`** — captured from a physical Videx Videoterm card with a ROM labeled VT-FRM-600 (c) 1982 VIDEX.
+- **`Videx Videoterm ROM VT-FRM-602.bin`** — captured from a physical Videx Videoterm card with a ROM labeled VT-FRM-602 (c) 1983 VIDEX.
 
 After meticulous transcription from photographic dumps, cross-checked against valid 6502 disassembly and confirmed byte-by-byte, the diffs are precise: **FRM-602 differs from 2.4 in 13 bytes; FRM-600 differs from 2.4 in 17 bytes**. Every single one of those differences sits within a 13-byte stretch from `$C808` to `$C82D` (the SETUP routine) and a 16-byte stretch from `$C8A1` to `$C8B0` (the CRTC initialization table). Nothing else changes — every other byte of the firmware, all 994+ of them, is byte-identical across all three variants.
 
