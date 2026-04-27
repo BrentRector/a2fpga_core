@@ -32,6 +32,7 @@ $C826:  E0 10            CPX #$10      ; reached 16?
 $C828:  D0 F1            BNE LOOP      ; no -- loop
 SETEXIT:
 $C82A:  8D 59 C0         STA $C059     ; assert 80-column mode
+$C82D:  60               RTS
 ```
 
 Both FRM-600 and FRM-602 instead count *down* from 15:
@@ -98,8 +99,8 @@ Plugging in:
 | Variant | htotal | V rows × cell + adj | V scanlines | Frame rate |
 |---|---|---|---|---|
 | 2.4 | 123 | 35 × 9 + 0 | 315 | **50.00 Hz** |
-| FRM-602 | 124 | 35 × 9 + 0 | 315 | **49.58 Hz** |
 | FRM-600 | 124 | 28 × 9 + 8 | 260 | **60.07 Hz** |
+| FRM-602 | 124 | 35 × 9 + 0 | 315 | **49.58 Hz** |
 
 The FRM-600 figure of 60.07 Hz is unmistakably NTSC. The 260-scanline V-total isn't true 525-line interlaced NTSC (which would require interlace mode and proper half-line timing) — it's a 60 Hz progressive frame at slightly fewer scanlines than NTSC odd-field, but most NTSC monitors and many TVs accept it as a near-NTSC composite feed. The HSync width also drops from 15 char clocks (~7.7 µs, suitable for PAL) to 9 char clocks (~4.6 µs, the NTSC HSync spec).
 
